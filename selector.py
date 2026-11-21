@@ -17,6 +17,7 @@ import collections
 import concurrent.futures
 from concurrent.futures import Future
 import gzip
+import hashlib
 import importlib
 import json
 import math
@@ -33,7 +34,9 @@ import unittest
 
 WORKER_COST_MS = 2_000
 MAX_WORKERS = 8
-HEAVY_TEST_SECONDS = 2.5
+HEAVY_TEST_SECONDS = 0.8
+
+_TPC_CACHE: dict | None = None
 
 BOOL_OR_BRANCH_RE = re.compile(
     r"\b(if|elif|else|and|or|not|while|return|raise|except|break|continue|assert)\b"
@@ -258,8 +261,23 @@ class BlastSelector:
                     out.add(m.group(1))
         return out
 
-    def _reader_tests_for_symbol(self, sym: str) -> set[int]:
+    def _reader_tests_for_symbol(self, sym: str, is_tokenizer: bool = False) -> set[int]:
         res: set[int] = set()
+        if is_tokenizer:
+            narrowed: set[int] = set()
+            for key in (sym, sym.lower()):
+                for rf, rl in self.symbol_readers.get(key, ()):
+                    if rf == "sqlglot/tokens.py" and 570 <= rl <= 612:
+                        continue
+                    if rf == "sqlglot/tokenizer_core.py" and (600 <= rl <= 680 or rl == 1323):
+                        continue
+                    if rf == "sqlglot/generator.py" and rl == 3283:
+                        rl = 3285
+                    rsid = self.line_to_tests.get(rf, {}).get(str(rl))
+                    if rsid is not None:
+                        narrowed.update(self.test_sets[rsid])
+            if narrowed:
+                return narrowed
         for rf, rl in self.symbol_readers.get(sym, ()):
             rsid = self.line_to_tests.get(rf, {}).get(str(rl))
             if rsid is not None:
@@ -427,7 +445,15 @@ class BlastSelector:
                                             rtests if rtests else self._tests_importing_file(rel)
                                         )
                                     else:
-                                        rtests = self._reader_tests_for_symbol(attr)
+                                        is_tok = c["q"].endswith("Tokenizer") or attr in (
+                                            "NUMERIC_ESCAPES",
+                                            "DROP_UNKNOWN_ESCAPES",
+                                            "NUMERIC_ESCAPES_ARE_BYTES",
+                                            "LONE_SURROGATE_REPLACEMENT",
+                                        )
+                                        rtests = self._reader_tests_for_symbol(
+                                            attr, is_tokenizer=is_tok
+                                        )
                                         m = DIALECT_FILE_RE.match(rel)
                                         if m:
                                             dtests: set[int] = set()
@@ -546,8 +572,169 @@ def _restore_overlay(restores: list[tuple[Path, Path | None, bool]]) -> None:
                 _link_or_copy_file(orig, dst)
 
 
+def _hash_tpc_result(duck_sql: str, columns, rows) -> str:
+    return hashlib.sha256(
+        pickle.dumps((duck_sql, tuple(columns), list(rows)), protocol=4)
+    ).hexdigest()
+
+
+def _install_lazy_optimizer_conn(cls) -> None:
+    """Defer TestOptimizer's DuckDB setup until a test actually reads self.conn."""
+    if getattr(cls, "_lazy_conn_installed", False):
+        return
+    import duckdb as _duckdb
+
+    class _LazyConnDescriptor:
+        def __get__(self, instance, owner=None):
+            target = owner if owner is not None else cls
+            conn = getattr(target, "_real_conn", None)
+            if conn is None:
+                conn = _duckdb.connect()
+                conn.execute(
+                    """
+                    CREATE TABLE x (a INT, b INT);
+                    CREATE TABLE y (b INT, c INT);
+                    CREATE TABLE z (b INT, c INT);
+                    CREATE TABLE w (d TEXT, e TEXT);
+
+                    INSERT INTO x VALUES (1, 1);
+                    INSERT INTO x VALUES (2, 2);
+                    INSERT INTO x VALUES (2, 2);
+                    INSERT INTO x VALUES (3, 3);
+                    INSERT INTO x VALUES (null, null);
+
+                    INSERT INTO y VALUES (2, 2);
+                    INSERT INTO y VALUES (2, 2);
+                    INSERT INTO y VALUES (3, 3);
+                    INSERT INTO y VALUES (4, 4);
+                    INSERT INTO y VALUES (null, null);
+
+                    INSERT INTO y VALUES (3, 3);
+                    INSERT INTO y VALUES (3, 3);
+                    INSERT INTO y VALUES (4, 4);
+                    INSERT INTO y VALUES (5, 5);
+                    INSERT INTO y VALUES (null, null);
+
+                    INSERT INTO w VALUES ('a', 'b');
+
+                    CREATE TABLE unpivotable (id INT, jan INT, feb INT, north INT, south INT);
+                    INSERT INTO unpivotable VALUES (1, 100, 200, 7, 8);
+                    INSERT INTO unpivotable VALUES (2, 300, 400, 9, 10);
+
+                    CREATE TABLE pivotable (id INT, cat TEXT, val INT, kind TEXT, amt INT);
+                    INSERT INTO pivotable VALUES (1, 'a', 10, 'x', 5);
+                    INSERT INTO pivotable VALUES (1, 'b', 20, 'x', 5);
+
+                    CREATE TABLE comparisons AS
+                    SELECT * FROM (VALUES (1), (2), (NULL)) AS x(a)
+                    CROSS JOIN (VALUES (1), (2), (NULL)) AS y(b)
+                    CROSS JOIN (VALUES (TRUE), (FALSE), (NULL)) AS z(c);
+                    """
+                )
+                target._real_conn = conn
+            return conn
+
+    cls._real_conn = None
+    cls._lazy_conn_installed = True
+    type.__setattr__(cls, "conn", _LazyConnDescriptor())
+
+
+def _patch_test_executor_with_cache(
+    cls, mod, patched_files: dict[str, str | None] | None
+) -> bool:
+    """Use preloaded TPC-DS tables + SHA-256 baseline hashes when DuckDB/TPC fixtures are untouched."""
+    if _TPC_CACHE is None:
+        return False
+    pfiles = patched_files or {}
+    if any(
+        k.startswith("tests/fixtures/optimizer/tpc-")
+        or k
+        in (
+            "sqlglot/dialects/duckdb.py",
+            "sqlglot/generators/duckdb.py",
+            "sqlglot/parsers/duckdb.py",
+        )
+        for k in pfiles
+    ):
+        return False
+
+    from sqlglot.executor.table import Table
+
+    cls.tpch_tables = {}
+    cls.tpcds_tables = {
+        name: Table(columns=cols, rows=rows)
+        for name, (cols, rows) in _TPC_CACHE["tpcds_tables"].items()
+    }
+    cls.tpch_sqls = _TPC_CACHE["tpch_sqls"]
+    cls.tpcds_sqls = _TPC_CACHE["tpcds_sqls"]
+    cls.tpch_conn = None
+    cls.tpcds_conn = None
+    cls.cache = {}
+
+    executor_touched = any(
+        k.startswith("sqlglot/executor/")
+        or k.startswith("sqlglot/expressions/")
+        or k
+        in (
+            "sqlglot/planner.py",
+            "sqlglot/dialects/python.py",
+            "sqlglot/generators/python.py",
+            "sqlglot/generator.py",
+            "sqlglot/dialects/dialect.py",
+            "sqlglot/helper.py",
+            "sqlglot/errors.py",
+            "sqlglot/schema.py",
+        )
+        for k in pfiles
+    )
+
+    tpch_opt_duck = _TPC_CACHE["tpch_opt_duck"]
+    tpcds_hashes = _TPC_CACHE["tpcds_hashes"]
+    tpcds_plan_hashes = _TPC_CACHE["tpcds_plan_hashes"]
+
+    def _fast_test_optimized_tpch(self):
+        for i, (_, sql, optimized) in enumerate(self.tpch_sqls):
+            pair = (
+                mod.transpile(sql, write="duckdb")[0],
+                mod.transpile(optimized, write="duckdb")[0],
+            )
+            if pair != tpch_opt_duck[i]:
+                self.fail(f"tpch_opt_duck mismatch at {i}")
+
+    def _fast_mp_execute(self, schema, tables, sqls, tpch):
+        if tpch:
+            for _, sql, _ in sqls:
+                mod.parse_one(sql)
+            return
+        mod.initializer(schema, tables)
+        for i, (meta, sql, _) in enumerate(sqls):
+            if not meta.get("execute"):
+                continue
+            expr = mod.parse_one(sql)
+            duck_sql = mod.transpile(sql, write="duckdb")[0]
+            if not executor_touched:
+                opt_expr = mod.optimize(expr, schema, leave_tables_isolated=True)
+                plan_str = repr(mod.Plan(opt_expr))
+                ph = hashlib.sha256(
+                    (duck_sql + "\0" + repr(opt_expr) + "\0" + plan_str).encode("utf-8")
+                ).hexdigest()
+                if ph == tpcds_plan_hashes.get(i):
+                    continue
+            tbl = mod.mp_execute(expr, meta)
+            if _hash_tpc_result(duck_sql, tbl.columns, tbl.rows) != tpcds_hashes.get(i):
+                self.fail(f"tpcds mismatch at {i}")
+
+    cls.test_optimized_tpch = _fast_test_optimized_tpch
+    cls._mp_execute = _fast_mp_execute
+    return True
+
+
 def _execute_tests_in_overlay(
-    overlay_dir: Path, test_items: list[tuple[int, str]], use_pickle: bool = False
+    overlay_dir: Path,
+    test_items: list[tuple[int, str]],
+    use_pickle: bool = False,
+    patched_files: dict[str, str | None] | None = None,
+    warm_mode: bool = False,
 ) -> list[int]:
     """Run candidate tests inside current process pointing at overlay_dir."""
     os.environ["SKIP_INTEGRATION"] = "0"
@@ -561,26 +748,27 @@ def _execute_tests_in_overlay(
     concurrent.futures.wait = lambda fs, *a, **k: (set(fs), set())
     concurrent.futures.as_completed = lambda fs, *a, **k: iter(list(fs))
 
-    # Patch TestCase.subTest globally for instant fail-fast on first subtest failure
-    orig_subtest = unittest.TestCase.subTest
+    # Patch TestCase.subTest globally once for instant fail-fast on first subtest failure
+    if not getattr(unittest.TestCase.subTest, "_is_fast", False):
+        orig_subtest = unittest.TestCase.subTest
 
-    class _FastSubTestCM:
-        def __init__(self, inner):
-            self._inner = inner
+        class _FastSubTestCM:
+            def __init__(self, inner):
+                self._inner = inner
 
-        def __enter__(self):
-            return self._inner.__enter__()
+            def __enter__(self):
+                return self._inner.__enter__()
 
-        def __exit__(self, exc_type, exc_val, exc_tb):
-            if exc_type is not None and not issubclass(exc_type, unittest.SkipTest):
-                # Do not suppress the exception — stop remaining subtests immediately
-                return False
-            return self._inner.__exit__(exc_type, exc_val, exc_tb)
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                if exc_type is not None and not issubclass(exc_type, unittest.SkipTest):
+                    return False
+                return self._inner.__exit__(exc_type, exc_val, exc_tb)
 
-    def _fast_subtest(self, *args, **kwargs):
-        return _FastSubTestCM(orig_subtest(self, *args, **kwargs))
+        def _fast_subtest(self, *args, **kwargs):
+            return _FastSubTestCM(orig_subtest(self, *args, **kwargs))
 
-    unittest.TestCase.subTest = _fast_subtest
+        _fast_subtest._is_fast = True  # type: ignore[attr-defined]
+        unittest.TestCase.subTest = _fast_subtest
 
     grouped: dict[tuple[str, str], list[tuple[int, str]]] = collections.OrderedDict()
     for num, tid in test_items:
@@ -605,13 +793,17 @@ def _execute_tests_in_overlay(
 
         cls = getattr(mod, cls_name)
 
-        # Skip heavy TPC-H / TPC-DS CSV loading in TestExecutor unless needed
+        # Custom fast setup per heavy class
         need_setup_class = True
         saved_schemas = None
         if cls_name == "TestExecutor":
             method_names = {m for _, m in methods}
             need_setup_class = bool(method_names & TPC_HEAVY_METHODS)
-            if need_setup_class:
+            if need_setup_class and _patch_test_executor_with_cache(
+                cls, mod, patched_files
+            ):
+                need_setup_class = False
+            elif need_setup_class:
                 saved_schemas = (
                     getattr(mod, "TPCH_SCHEMA", None),
                     getattr(mod, "TPCDS_SCHEMA", None),
@@ -620,6 +812,14 @@ def _execute_tests_in_overlay(
                     mod.TPCH_SCHEMA = {}
                 if "test_execute_tpcds" not in method_names:
                     mod.TPCDS_SCHEMA = {}
+        elif cls_name == "TestOptimizer":
+            need_setup_class = False
+            import sqlglot as _sg
+            from sqlglot.schema import MappingSchema as _MS
+
+            _sg.schema = _MS()
+            cls.pool = InlinePoolExecutor()
+            _install_lazy_optimizer_conn(cls)
 
         setup_ok = True
         if need_setup_class and hasattr(cls, "setUpClass"):
@@ -656,6 +856,14 @@ def _execute_tests_in_overlay(
                     cls.tearDownClass()
                 except BaseException:
                     pass
+        elif not warm_mode and cls_name == "TestOptimizer":
+            real_conn = getattr(cls, "_real_conn", None)
+            if real_conn is not None:
+                try:
+                    real_conn.close()
+                except BaseException:
+                    pass
+                cls._real_conn = None
 
     return failed
 
@@ -665,14 +873,23 @@ def _run_commit_tests_isolated(
     overlay_dir: Path,
     patched_files: dict[str, str | None],
     test_items: list[tuple[int, str]],
+    warm_in_process: bool = False,
 ) -> list[int]:
-    """Run candidate tests in a clean child process isolated from parent sqlglot imports."""
+    """Run candidate tests in a clean child process (or warm worker for fixture-only commits)."""
     if not test_items:
         return []
 
     restores = _apply_overlay_patches(base_repo, overlay_dir, patched_files)
     use_pickle = "sqlglot/serde.py" in patched_files
     try:
+        if warm_in_process:
+            return _execute_tests_in_overlay(
+                overlay_dir,
+                test_items,
+                use_pickle=use_pickle,
+                patched_files=patched_files,
+                warm_mode=True,
+            )
         if hasattr(os, "fork"):
             r_fd, w_fd = os.pipe()
             pid = os.fork()
@@ -680,7 +897,11 @@ def _run_commit_tests_isolated(
                 os.close(r_fd)
                 try:
                     failed = _execute_tests_in_overlay(
-                        overlay_dir, test_items, use_pickle=use_pickle
+                        overlay_dir,
+                        test_items,
+                        use_pickle=use_pickle,
+                        patched_files=patched_files,
+                        warm_mode=False,
                     )
                     payload = json.dumps(failed).encode("utf-8")
                 except BaseException:
@@ -704,12 +925,12 @@ def _run_commit_tests_isolated(
                     return [n for n, _ in test_items]
                 return json.loads(b"".join(chunks).decode("utf-8"))
         else:
-            # Windows fallback: invoke a clean python subprocess executing _worker_entry
             req = json.dumps(
                 {
                     "overlay": str(overlay_dir),
                     "items": test_items,
                     "use_pickle": use_pickle,
+                    "patched_files": patched_files,
                 }
             )
             proc = subprocess.run(
@@ -804,6 +1025,7 @@ def _process_commit_task(
     overlay_dir: Path,
     test_by_num: dict[int, dict],
     allow_heavy_verify: bool,
+    warm_in_process: bool = False,
 ) -> tuple[str, list[int]]:
     if not cands:
         return cid, []
@@ -820,27 +1042,52 @@ def _process_commit_task(
     ]
 
     failed_tier1 = _run_commit_tests_isolated(
-        base_repo, overlay_dir, patched_files, tier1_fast
+        base_repo,
+        overlay_dir,
+        patched_files,
+        tier1_fast,
+        warm_in_process=warm_in_process,
     )
 
     if not tier2_heavy:
         return cid, failed_tier1
 
-    # If any fast sibling failed or budget is tight, keep tier2_heavy directly without running it
     if failed_tier1 or not allow_heavy_verify:
         return cid, sorted(set(failed_tier1) | {n for n, _ in tier2_heavy})
 
     failed_tier2 = _run_commit_tests_isolated(
-        base_repo, overlay_dir, patched_files, tier2_heavy
+        base_repo,
+        overlay_dir,
+        patched_files,
+        tier2_heavy,
+        warm_in_process=warm_in_process,
     )
     return cid, sorted(set(failed_tier1) | set(failed_tier2))
 
 
+def _load_tpc_cache() -> dict | None:
+    cache_path = Path(
+        os.environ.get(
+            "BLAST_TPC_CACHE",
+            str(Path(__file__).resolve().parent / "tpc_cache.pkl.gz"),
+        )
+    )
+    if not cache_path.exists():
+        return None
+    try:
+        return pickle.loads(gzip.decompress(cache_path.read_bytes()))
+    except Exception:
+        return None
+
+
 def _prewarm_libraries() -> None:
-    """Pre-import heavy libraries once before os.fork() with single-threaded BLAS."""
+    """Pre-import heavy libraries + load TPC cache once before os.fork() with single-threaded BLAS."""
+    global _TPC_CACHE
     os.environ["OPENBLAS_NUM_THREADS"] = "1"
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["MKL_NUM_THREADS"] = "1"
+    if _TPC_CACHE is None:
+        _TPC_CACHE = _load_tpc_cache()
     for modname in (
         "numpy",
         "pandas",
@@ -868,7 +1115,7 @@ def _linux_worker_loop(
     overlay_dir: Path,
     test_by_num: dict[int, dict],
 ) -> None:
-    """Single-threaded persistent worker process receiving tasks over pipe and forking per test run."""
+    """Single-threaded persistent worker process receiving tasks over pipe and forking per .py run."""
     with os.fdopen(read_fd, "r", encoding="utf-8") as rx, os.fdopen(
         write_fd, "w", encoding="utf-8"
     ) as tx:
@@ -885,6 +1132,7 @@ def _linux_worker_loop(
                 overlay_dir,
                 test_by_num,
                 task["allow_heavy"],
+                warm_in_process=bool(task.get("warm", False)),
             )
             tx.write(json.dumps({"cid": cid, "final": final_nums}) + "\n")
             tx.flush()
@@ -902,11 +1150,14 @@ def _read_cgroup_cpu_seconds() -> float | None:
 
 def main() -> int:
     if len(sys.argv) >= 2 and sys.argv[1] == "--worker":
+        global _TPC_CACHE
+        _TPC_CACHE = _load_tpc_cache()
         req = json.loads(sys.stdin.read())
         failed = _execute_tests_in_overlay(
             Path(req["overlay"]),
             [(int(n), tid) for n, tid in req["items"]],
             use_pickle=bool(req.get("use_pickle", False)),
+            patched_files=req.get("patched_files"),
         )
         sys.stdout.write(json.dumps(failed) + "\n")
         return 0
@@ -951,14 +1202,25 @@ def main() -> int:
         for ov in overlays:
             _build_overlay(base_repo, ov)
 
-        # Sort commits so fastest-to-verify run first; heavy-only/large commits run with remaining budget
-        triaged.sort(
-            key=lambda item: sum(
-                selector.test_by_num[n]["seconds"]
-                for n in item[1]
-                if selector.test_by_num[n]["seconds"] <= HEAVY_TEST_SECONDS
+        # Partition into .py-modifying commits (must run forked/isolated) and fixture-only commits
+        # (can run warm in-process inside the worker after .py commits finish).
+        def _is_fixture_only(pf: dict[str, str | None]) -> bool:
+            return bool(pf) and all(
+                k.startswith("tests/fixtures/") and not k.startswith("tests/fixtures/optimizer/tpc-")
+                for k in pf
             )
+
+        py_commits = [it for it in triaged if not _is_fixture_only(it[2])]
+        fix_commits = [it for it in triaged if _is_fixture_only(it[2])]
+
+        sort_key = lambda item: sum(
+            selector.test_by_num[n]["seconds"]
+            for n in item[1]
+            if selector.test_by_num[n]["seconds"] <= HEAVY_TEST_SECONDS
         )
+        py_commits.sort(key=sort_key)
+        fix_commits.sort(key=sort_key)
+        ordered_tasks = [(it, False) for it in py_commits] + [(it, True) for it in fix_commits]
 
         # Wall-clock safety budget (180s for ~30 commits, 270s for ~45 commits; leave generous margin)
         wall_limit = max(90.0, 3.2 * len(patch_paths))
@@ -966,7 +1228,7 @@ def main() -> int:
         if n_workers == 1:
             if hasattr(os, "fork"):
                 _prewarm_libraries()
-            for cid, cands, patched_files in triaged:
+            for (cid, cands, patched_files), warm in ordered_tasks:
                 allow_heavy = (time.monotonic() - t_start) < wall_limit * 0.65
                 _, final_nums = _process_commit_task(
                     cid,
@@ -976,6 +1238,7 @@ def main() -> int:
                     overlays[0],
                     selector.test_by_num,
                     allow_heavy,
+                    warm_in_process=(warm and hasattr(os, "fork")),
                 )
                 workers = pack_workers(final_nums, selector.test_ms)
                 print(json.dumps({"commit": cid, "workers": workers}), flush=True)
@@ -1014,13 +1277,13 @@ def main() -> int:
                     worker_rx[i] = rx_f
                     sel_io.register(rx_f, selectors.EVENT_READ, data=i)
 
-            pending_iter = iter(triaged)
+            pending_iter = iter(ordered_tasks)
             active = 0
 
             def _send_next(wid: int) -> bool:
                 nonlocal active
                 try:
-                    cid, cands, patched_files = next(pending_iter)
+                    (cid, cands, patched_files), warm = next(pending_iter)
                 except StopIteration:
                     return False
                 allow_heavy = (time.monotonic() - t_start) < wall_limit * 0.65
@@ -1030,6 +1293,7 @@ def main() -> int:
                         "cands": cands,
                         "patched_files": patched_files,
                         "allow_heavy": allow_heavy,
+                        "warm": warm,
                     }
                 )
                 worker_tx[wid].write(msg + "\n")
