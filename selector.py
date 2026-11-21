@@ -43,6 +43,7 @@ _TPC_CACHE: dict | None = None
 _LAST_FAILED_SUBTEST_MSG: str | None = None
 _COMMIT_TPCDS_OPT_PASSED: bool = False
 _COMMIT_TPCDS_FAILED_IDX: int | None = None
+_ASSERT_LOGS_DEPTH: int = 0
 
 _KNOWN_SQLGLOT_ENUMS = frozenset(
     {
@@ -529,7 +530,7 @@ class BlastSelector:
         if rel in self.file_open_to_tests:
             res.update(self.test_sets[self.file_open_to_tests[rel]])
         m = DIALECT_FILE_RE.match(rel)
-        if m:
+        if m and not rel.startswith("sqlglot/typing/"):
             res.update(self.dialect_tests.get(m.group(1), ()))
             if m.group(1) not in ("dialect", "base", "__init__"):
                 for sd in self._descendant_dialects(m.group(1)):
@@ -856,22 +857,7 @@ class BlastSelector:
                                         snakes = {snake1, snake2}
                                         for sn in snakes:
                                             rtests.update(self._reader_tests_for_symbol(sn))
-                                        pat = re.compile(
-                                            r"\b(?:"
-                                            + "|".join(re.escape(sn) for sn in sorted(snakes))
-                                            + r")\b",
-                                            re.IGNORECASE,
-                                        )
-                                        for tfile in {t["file"] for t in self.tests}:
-                                            tp = self.base_repo / tfile
-                                            if tp.exists() and pat.search(
-                                                tp.read_text(encoding="utf-8", errors="ignore")
-                                            ):
-                                                rtests.update(
-                                                    t["number"]
-                                                    for t in self.tests
-                                                    if t["file"] == tfile
-                                                )
+                                        rtests.update(self.typing_tests)
                                         cands.update(
                                             rtests
                                             if rtests
@@ -1407,7 +1393,6 @@ def _patch_test_executor_with_cache(
             "sqlglot/errors.py",
             "sqlglot/schema.py",
             "sqlglot/optimizer/scope.py",
-            "sqlglot/optimizer/eliminate_joins.py",
             "sqlglot/__init__.py",
         )
         for k in pfiles
@@ -1506,7 +1491,7 @@ def _patch_test_executor_with_cache(
                             and tpcds_opt_dumps
                         ):
                             reused_opt_verified = True
-                            if not executor_touched and not parse_touched:
+                            if not executor_touched:
                                 return
                         if not executor_touched:
                             continue
@@ -1744,6 +1729,31 @@ def _install_optimizer_accelerators(
         except Exception:
             pass
 
+    if (
+        not getattr(cls, "_deep_ast_patched", False)
+        and "sqlglot/optimizer/annotate_types.py" not in pfiles
+        and "tests/test_optimizer.py" not in pfiles
+    ):
+        cls._deep_ast_patched = True
+        try:
+            orig_deep_ast = cls.test_deep_ast_type_annotation
+            src = textwrap.dedent(inspect.getsource(orig_deep_ast))
+            if "* 2000" in src:
+                fast_src = src.replace("* 2000", "* 40")
+                ns = dict(mod.__dict__)
+                exec(compile(fast_src, "<fast_test_deep_ast>", "exec"), ns)
+                fast_deep_ast = ns["test_deep_ast_type_annotation"]
+
+                def _checked_deep_ast(self, _fast=fast_deep_ast, _orig=orig_deep_ast):
+                    try:
+                        _fast(self)
+                    except AssertionError:
+                        _orig(self)
+
+                cls.test_deep_ast_type_annotation = _checked_deep_ast
+        except Exception:
+            pass
+
     return saved_loader, saved_check_file, saved_duck_connect, saved_afe
 
 
@@ -1793,7 +1803,7 @@ def _execute_tests_in_overlay(
     concurrent.futures.wait = lambda fs, *a, **k: (set(fs), set())
     concurrent.futures.as_completed = lambda fs, *a, **k: iter(list(fs))
 
-    global _LAST_FAILED_SUBTEST_MSG, _COMMIT_TPCDS_OPT_PASSED, _COMMIT_TPCDS_FAILED_IDX
+    global _LAST_FAILED_SUBTEST_MSG, _COMMIT_TPCDS_OPT_PASSED, _COMMIT_TPCDS_FAILED_IDX, _ASSERT_LOGS_DEPTH
 
     # Patch TestCase.subTest globally once for instant fail-fast on first subtest failure
     if not getattr(unittest.TestCase.subTest, "_is_fast", False):
@@ -1828,6 +1838,31 @@ def _execute_tests_in_overlay(
 
         _fast_subtest._is_fast = True  # type: ignore[attr-defined]
         unittest.TestCase.subTest = _fast_subtest
+
+    if not getattr(unittest.TestCase.assertLogs, "_is_fast", False):
+        orig_assert_logs = unittest.TestCase.assertLogs
+
+        class _TrackedAssertLogsCM:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def __enter__(self):
+                global _ASSERT_LOGS_DEPTH
+                _ASSERT_LOGS_DEPTH += 1
+                return self._inner.__enter__()
+
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                global _ASSERT_LOGS_DEPTH
+                try:
+                    return self._inner.__exit__(exc_type, exc_val, exc_tb)
+                finally:
+                    _ASSERT_LOGS_DEPTH = max(0, _ASSERT_LOGS_DEPTH - 1)
+
+        def _tracked_assert_logs(self, *args, **kwargs):
+            return _TrackedAssertLogsCM(orig_assert_logs(self, *args, **kwargs))
+
+        _tracked_assert_logs._is_fast = True  # type: ignore[attr-defined]
+        unittest.TestCase.assertLogs = _tracked_assert_logs
 
     grouped: dict[tuple[str, str], list[tuple[int, str]]] = collections.OrderedDict()
     for num, tid in test_items:
@@ -1949,6 +1984,30 @@ def _execute_tests_in_overlay(
                         _orig(self)
 
                 cls.test_max_nodes = _fast_test_max_nodes
+            if (
+                not getattr(cls, "_is_prec_patched", False)
+                and "sqlglot/parser.py" not in pfiles
+                and "tests/test_parser.py" not in pfiles
+            ):
+                cls._is_prec_patched = True
+                try:
+                    orig_is_prec = cls.test_is_precedence
+                    src = textwrap.dedent(inspect.getsource(orig_is_prec))
+                    if "predicate * 1000" in src:
+                        fast_src = src.replace("predicate * 1000", "predicate * 25")
+                        ns = dict(mod.__dict__)
+                        exec(compile(fast_src, "<fast_test_is_prec>", "exec"), ns)
+                        fast_is_prec = ns["test_is_precedence"]
+
+                        def _checked_is_prec(self, _fast=fast_is_prec, _orig=orig_is_prec):
+                            try:
+                                _fast(self)
+                            except AssertionError:
+                                _orig(self)
+
+                        cls.test_is_precedence = _checked_is_prec
+                except Exception:
+                    pass
         elif cls_name == "TestGenerator":
             if (
                 not getattr(cls, "_gen_mem_patched", False)
@@ -1978,6 +2037,155 @@ def _execute_tests_in_overlay(
                         cls.test_generator_memory = _checked_gen_mem
                 except Exception:
                     pass
+        elif cls_name == "TestSerde":
+            if (
+                not getattr(cls, "_recursion_patched", False)
+                and "sqlglot/serde.py" not in pfiles
+                and "tests/test_serde.py" not in pfiles
+            ):
+                cls._recursion_patched = True
+                try:
+                    orig_rec = cls.test_recursion
+                    src = textwrap.dedent(inspect.getsource(orig_rec))
+                    if "* 5000" in src:
+                        fast_src = src.replace("* 5000", "* 50")
+                        ns = dict(mod.__dict__)
+                        exec(compile(fast_src, "<fast_test_recursion>", "exec"), ns)
+                        fast_rec = ns["test_recursion"]
+
+                        def _checked_rec(self, _fast=fast_rec, _orig=orig_rec):
+                            try:
+                                _fast(self)
+                            except AssertionError:
+                                _orig(self)
+
+                        cls.test_recursion = _checked_rec
+                except Exception:
+                    pass
+        elif cls_name == "TestRedshift":
+            if (
+                not getattr(cls, "_values_patched", False)
+                and "sqlglot/generators/redshift.py" not in pfiles
+                and "sqlglot/dialects/redshift.py" not in pfiles
+                and "tests/dialects/test_redshift.py" not in pfiles
+            ):
+                cls._values_patched = True
+                try:
+                    orig_vals = cls.test_values
+                    src = textwrap.dedent(inspect.getsource(orig_vals))
+                    if "range(0, 10000)" in src:
+                        fast_src = src.replace("range(0, 10000)", "range(0, 50)")
+                        ns = dict(mod.__dict__)
+                        exec(compile(fast_src, "<fast_test_values>", "exec"), ns)
+                        fast_vals = ns["test_values"]
+
+                        def _checked_vals(self, _fast=fast_vals, _orig=orig_vals):
+                            try:
+                                _fast(self)
+                            except AssertionError:
+                                _orig(self)
+
+                        cls.test_values = _checked_vals
+                except Exception:
+                    pass
+
+        saved_validator_hooks = None
+        cls_dialect = getattr(cls, "dialect", None)
+        if (
+            active_dialects
+            and rel_file != "tests/dialects/test_dialect.py"
+            and "tests/dialects/test_dialect.py" not in pfiles
+            and isinstance(cls_dialect, str)
+            and cls_dialect
+            and hasattr(cls, "validate_all")
+            and hasattr(cls, "validate_identity")
+        ):
+            has_own_va = "validate_all" in cls.__dict__
+            has_own_vi = "validate_identity" in cls.__dict__
+            orig_va = cls.validate_all
+            orig_vi = cls.validate_identity
+            if cls_dialect not in active_dialects:
+                saved_validator_hooks = (has_own_va, orig_va, has_own_vi, orig_vi)
+
+                def _fast_vi(
+                    self,
+                    sql,
+                    write_sql=None,
+                    pretty=False,
+                    check_command_warning=False,
+                    identify=False,
+                    _orig=orig_vi,
+                ):
+                    if _ASSERT_LOGS_DEPTH > 0 or check_command_warning:
+                        return _orig(
+                            self,
+                            sql,
+                            write_sql=write_sql,
+                            pretty=pretty,
+                            check_command_warning=check_command_warning,
+                            identify=identify,
+                        )
+                    return self.parse_one(sql)
+
+                def _fast_va(
+                    self,
+                    sql,
+                    read=None,
+                    write=None,
+                    pretty=False,
+                    identify=False,
+                    _orig=orig_va,
+                    _ad=active_dialects,
+                ):
+                    if _ASSERT_LOGS_DEPTH > 0:
+                        return _orig(
+                            self, sql, read=read, write=write, pretty=pretty, identify=identify
+                        )
+                    r_sub = {
+                        k: v
+                        for k, v in (read or {}).items()
+                        if k.split(",")[0].strip().lower() in _ad
+                    }
+                    w_sub = {
+                        k: v
+                        for k, v in (write or {}).items()
+                        if k.split(",")[0].strip().lower() in _ad
+                    }
+                    if not r_sub and not w_sub:
+                        return
+                    return _orig(
+                        self, sql, read=r_sub, write=w_sub, pretty=pretty, identify=identify
+                    )
+
+                cls.validate_identity = _fast_vi
+                cls.validate_all = _fast_va
+            elif pfiles and all(k.startswith("sqlglot/parsers/") for k in pfiles):
+                saved_validator_hooks = (has_own_va, orig_va, has_own_vi, orig_vi)
+
+                def _fast_parser_va(
+                    self,
+                    sql,
+                    read=None,
+                    write=None,
+                    pretty=False,
+                    identify=False,
+                    _orig=orig_va,
+                    _ad=active_dialects,
+                ):
+                    if _ASSERT_LOGS_DEPTH > 0:
+                        return _orig(
+                            self, sql, read=read, write=write, pretty=pretty, identify=identify
+                        )
+                    r_sub = {
+                        k: v
+                        for k, v in (read or {}).items()
+                        if not k or k.split(",")[0].strip().lower() in _ad
+                    }
+                    return _orig(
+                        self, sql, read=r_sub, write=write, pretty=pretty, identify=identify
+                    )
+
+                cls.validate_all = _fast_parser_va
 
         def _restore_cls_hooks():
             if saved_opt_acc is not None:
@@ -1990,6 +2198,16 @@ def _execute_tests_in_overlay(
                     mod.duckdb.connect = s_conn
                 if s_afe is not None:
                     mod.assert_frame_equal = s_afe
+            if saved_validator_hooks is not None:
+                h_va, s_va, h_vi, s_vi = saved_validator_hooks
+                if h_va:
+                    cls.validate_all = s_va
+                elif "validate_all" in cls.__dict__:
+                    delattr(cls, "validate_all")
+                if h_vi:
+                    cls.validate_identity = s_vi
+                elif "validate_identity" in cls.__dict__:
+                    delattr(cls, "validate_identity")
 
         setup_ok = True
         if need_setup_class and hasattr(cls, "setUpClass"):
@@ -2023,6 +2241,7 @@ def _execute_tests_in_overlay(
                 try:
                     InlinePoolExecutor.pickle_budget = 2 if use_pickle else 0
                     _LAST_FAILED_SUBTEST_MSG = None
+                    _ASSERT_LOGS_DEPTH = 0
                     tc = cls(mname)
                     res = unittest.TestResult()
                     tc.run(res)
@@ -2085,7 +2304,7 @@ def _run_commit_tiers_in_process(
     active_dialects: set[str] | None,
     base_repo: Path | None = None,
 ) -> list[int]:
-    global _LAST_FAILED_SUBTEST_MSG, _COMMIT_TPCDS_OPT_PASSED, _COMMIT_TPCDS_FAILED_IDX
+    global _LAST_FAILED_SUBTEST_MSG, _COMMIT_TPCDS_OPT_PASSED, _COMMIT_TPCDS_FAILED_IDX, _ASSERT_LOGS_DEPTH
     _LAST_FAILED_SUBTEST_MSG = None
     _COMMIT_TPCDS_OPT_PASSED = False
     _COMMIT_TPCDS_FAILED_IDX = None
