@@ -132,10 +132,20 @@ def parse_patch(patch_text: str) -> list[dict]:
             parts = line.strip().split()
             old_p = parts[2][2:] if len(parts) >= 4 and parts[2].startswith("a/") else None
             new_p = parts[3][2:] if len(parts) >= 4 and parts[3].startswith("b/") else None
-            cur = {"old": old_p, "new": new_p, "hunks": []}
+            cur = {"old": old_p, "new": new_p, "hunks": [], "is_new": False, "is_deleted": False}
             hunk = None
         elif cur is not None:
-            if line.startswith("--- "):
+            if line.startswith("new file mode "):
+                cur["is_new"] = True
+                cur["old"] = None
+            elif line.startswith("deleted file mode "):
+                cur["is_deleted"] = True
+                cur["new"] = None
+            elif line.startswith("rename from "):
+                cur["old"] = line[12:].strip()
+            elif line.startswith("rename to "):
+                cur["new"] = line[10:].strip()
+            elif line.startswith("--- "):
                 p = line[4:].strip()
                 cur["old"] = None if p == "/dev/null" else (p[2:] if p.startswith("a/") else p)
             elif line.startswith("+++ "):
@@ -168,14 +178,24 @@ def apply_hunks(orig_text: str, hunks: list[dict]) -> str:
         start_idx = max(0, h["old_start"] - 1) if h["old_start"] > 0 else 0
         out.extend(orig_lines[idx:start_idx])
         cur_old = start_idx
+        last_plus = False
         for hl in h["lines"]:
             if hl.startswith(" "):
                 out.append(orig_lines[cur_old] if cur_old < len(orig_lines) else hl[1:])
                 cur_old += 1
+                last_plus = False
             elif hl.startswith("-"):
                 cur_old += 1
+                last_plus = False
             elif hl.startswith("+"):
                 out.append(hl[1:])
+                last_plus = True
+            elif hl.startswith("\\") and last_plus and out:
+                if out[-1].endswith("\r\n"):
+                    out[-1] = out[-1][:-2]
+                elif out[-1].endswith("\n"):
+                    out[-1] = out[-1][:-1]
+                last_plus = False
         idx = cur_old
     out.extend(orig_lines[idx:])
     return "".join(out)
@@ -237,6 +257,9 @@ class BlastSelector:
         self.lazy_load_tests = [
             t["number"] for t in self.tests if t["id"].endswith("::test_lazy_load")
         ]
+        self.enum_tests = [
+            t["number"] for t in self.tests if t["id"].endswith("::test_enum")
+        ]
         self.typing_tests = [
             t["number"] for t in self.tests if t["file"] == "tests/test_typing.py"
         ]
@@ -266,11 +289,51 @@ class BlastSelector:
                 m = DIALECT_FILE_RE.match(d["file"])
                 if m:
                     out.add(m.group(1))
+        # Expand transitively through direct dialect module imports (composition without inheritance)
+        d_q = list(out)
+        while d_q:
+            cur_d = d_q.pop()
+            for mod_pfx in ("dialects", "parsers", "generators", "typing"):
+                for imp_rel in self.reverse_mod_files.get(f"sqlglot.{mod_pfx}.{cur_d}", ()):
+                    m = DIALECT_FILE_RE.match(imp_rel)
+                    if m and m.group(1) not in out:
+                        sub_d = self._subclasses_dialects_only(m.group(1))
+                        for sd in sub_d:
+                            if sd not in out:
+                                out.add(sd)
+                                d_q.append(sd)
+        return out
+
+    def _subclasses_dialects_only(self, dname: str) -> set[str]:
+        target_files = {
+            f"sqlglot/dialects/{dname}.py",
+            f"sqlglot/parsers/{dname}.py",
+            f"sqlglot/generators/{dname}.py",
+            f"sqlglot/typing/{dname}.py",
+        }
+        queue = [
+            cname
+            for cname, dl in self.class_graph.items()
+            if any(d["file"] in target_files and "." not in d["q"] for d in dl)
+        ]
+        seen = set(queue)
+        while queue:
+            cur = queue.pop()
+            for sub in self.subclasses.get(cur, ()):
+                if sub not in seen:
+                    seen.add(sub)
+                    queue.append(sub)
+        out = {dname}
+        for cname in seen:
+            for d in self.class_graph.get(cname, ()):
+                m = DIALECT_FILE_RE.match(d["file"])
+                if m:
+                    out.add(m.group(1))
         return out
 
     def _reader_tests_for_symbol(self, sym: str, is_tokenizer: bool = False) -> set[int]:
         res: set[int] = set()
-        if is_tokenizer:
+        if is_tokenizer and sym == "NUMERIC_ESCAPES":
             narrowed: set[int] = set()
             for key in (sym, sym.lower()):
                 for rf, rl in self.symbol_readers.get(key, ()):
@@ -278,8 +341,6 @@ class BlastSelector:
                         continue
                     if rf == "sqlglot/tokenizer_core.py" and (600 <= rl <= 680 or rl == 1323):
                         continue
-                    if rf == "sqlglot/generator.py" and rl == 3283:
-                        rl = 3285
                     rsid = self.line_to_tests.get(rf, {}).get(str(rl))
                     if rsid is not None:
                         narrowed.update(self.test_sets[rsid])
@@ -292,6 +353,8 @@ class BlastSelector:
         return res
 
     def _tests_importing_file(self, rel: str) -> set[int]:
+        if rel == "tests/helpers.py":
+            return set(self.all_test_nums)
         res: set[int] = set()
         if rel in self.file_to_tests:
             res.update(self.test_sets[self.file_to_tests[rel]])
@@ -300,6 +363,10 @@ class BlastSelector:
         m = DIALECT_FILE_RE.match(rel)
         if m:
             res.update(self.dialect_tests.get(m.group(1), ()))
+        if rel.startswith("sqlglot/dialects/"):
+            res.update(self.enum_tests)
+        if rel.startswith("sqlglot/"):
+            res.update(self.lazy_load_tests)
         if rel.startswith("sqlglot/typing/"):
             res.update(self.typing_tests)
         if rel.startswith("tests/") and not rel.startswith("tests/fixtures/"):
@@ -336,26 +403,44 @@ class BlastSelector:
             if not rel:
                 continue
 
-            orig_path = self.base_repo / rel
-            if new_rel is None and old_rel is not None:
+            if f.get("is_deleted") or (new_rel is None and old_rel is not None):
                 # Deleted file
-                patched_files[old_rel] = None
-                cands.update(self._tests_importing_file(old_rel))
+                target_del = old_rel or rel
+                patched_files[target_del] = None
+                cands.update(self._tests_importing_file(target_del))
                 continue
 
-            if old_rel is None and new_rel is not None:
+            if f.get("is_new") or (old_rel is None and new_rel is not None):
                 # Brand new file
+                target_new = new_rel or rel
                 new_src = apply_hunks("", f["hunks"])
-                patched_files[new_rel] = new_src
-                m = DIALECT_FILE_RE.match(new_rel)
+                patched_files[target_new] = new_src
+                new_cands: set[int] = set()
+                m = DIALECT_FILE_RE.match(target_new)
                 if m:
-                    cands.update(self.dialect_tests.get(m.group(1), ()))
-                if new_rel.startswith("sqlglot/typing/"):
-                    cands.update(self.typing_tests)
-                if not cands:
-                    cands.update(self.all_test_nums)
+                    for d in self._descendant_dialects(m.group(1)):
+                        new_cands.update(self.dialect_tests.get(d, ()))
+                if target_new.startswith("sqlglot/typing/"):
+                    new_cands.update(self.typing_tests)
+                if not new_cands:
+                    new_cands.update(self.all_test_nums)
+                cands.update(new_cands)
                 continue
 
+            if old_rel is not None and new_rel is not None and old_rel != new_rel:
+                # Renamed file
+                old_p = self.base_repo / old_rel
+                old_src = (
+                    old_p.read_text(encoding="utf-8", errors="replace") if old_p.exists() else ""
+                )
+                new_src = apply_hunks(old_src, f["hunks"])
+                patched_files[old_rel] = None
+                patched_files[new_rel] = new_src
+                rcands = self._tests_importing_file(old_rel) | self._tests_importing_file(new_rel)
+                cands.update(rcands if rcands else self.all_test_nums)
+                continue
+
+            orig_path = self.base_repo / rel
             if not orig_path.exists():
                 cands.update(self.all_test_nums)
                 continue
@@ -365,10 +450,10 @@ class BlastSelector:
 
             if rel.endswith(".py"):
                 try:
-                    t1 = ast.parse(old_src)
-                    t2 = ast.parse(new_src)
-                    compile(new_src, rel, "exec")
-                except SyntaxError:
+                    t1 = ast.parse(old_src.encode("utf-8"))
+                    t2 = ast.parse(new_src.encode("utf-8"))
+                    compile(new_src.encode("utf-8"), rel, "exec")
+                except (SyntaxError, LookupError, UnicodeError):
                     patched_files[rel] = new_src
                     cands.update(self._tests_importing_file(rel))
                     continue
@@ -377,6 +462,7 @@ class BlastSelector:
                     ast.dump(t1, include_attributes=False)
                     == ast.dump(t2, include_attributes=False)
                     and not _has_encoding_change(old_src, new_src)
+                    and rel not in self.file_open_to_tests
                 ):
                     # Pure comment/whitespace edit in a Python file
                     continue
@@ -392,6 +478,7 @@ class BlastSelector:
             # Extract changed line numbers against original file
             changed_old_lines: dict[int, str] = {}
             pure_insert_anchors: set[int] = set()
+            insert_line_texts: dict[int, str] = {}
             for h in f["hunks"]:
                 ln = h["old_start"]
                 prev_minus = False
@@ -411,7 +498,11 @@ class BlastSelector:
                         else:
                             if ln > 1:
                                 pure_insert_anchors.add(ln - 1)
+                                insert_line_texts[ln - 1] = (
+                                    insert_line_texts.get(ln - 1, "") + "\n" + hl[1:]
+                                )
                             pure_insert_anchors.add(ln)
+                            insert_line_texts[ln] = insert_line_texts.get(ln, "") + "\n" + hl[1:]
 
             if not rel.endswith(".py"):
                 if rel not in self.file_open_to_tests:
@@ -424,7 +515,7 @@ class BlastSelector:
             classes = self.file_classes.get(rel, [])
 
             for ln in list(changed_old_lines.keys()) + sorted(pure_insert_anchors):
-                txt = changed_old_lines.get(ln, "")
+                txt = changed_old_lines.get(ln, "") or insert_line_texts.get(ln, "")
                 sid = lmap.get(str(ln))
                 if sid is not None:
                     cands.update(self.test_sets[sid])
@@ -438,7 +529,7 @@ class BlastSelector:
                             cands.update(self.test_sets[fsid])
                         else:
                             cands.update(self._tests_importing_file(rel))
-                elif ln in changed_old_lines:
+                else:
                     hit = False
                     for c in classes:
                         if c["s"] <= ln <= c["e"]:
@@ -447,7 +538,28 @@ class BlastSelector:
                                     hit = True
                                     cname = c["q"].split(".")[-1]
                                     if rel.startswith("sqlglot/expressions/"):
-                                        rtests = self._reader_tests_for_symbol(cname)
+                                        rtests = set(self._reader_tests_for_symbol(cname))
+                                        for cln in range(c["s"], c["e"] + 1):
+                                            csid = lmap.get(str(cln))
+                                            if csid is not None:
+                                                rtests.update(self.test_sets[csid])
+                                        snake = re.sub(
+                                            r"([a-z0-9])([A-Z])", r"\1_\2", cname
+                                        ).upper()
+                                        rtests.update(self._reader_tests_for_symbol(snake))
+                                        pat = re.compile(
+                                            r"\b" + re.escape(snake) + r"\b", re.IGNORECASE
+                                        )
+                                        for tfile in {t["file"] for t in self.tests}:
+                                            tp = self.base_repo / tfile
+                                            if tp.exists() and pat.search(
+                                                tp.read_text(encoding="utf-8", errors="ignore")
+                                            ):
+                                                rtests.update(
+                                                    t["number"]
+                                                    for t in self.tests
+                                                    if t["file"] == tfile
+                                                )
                                         cands.update(
                                             rtests if rtests else self._tests_importing_file(rel)
                                         )
@@ -745,6 +857,13 @@ class _CachedDuckCursor:
         return getattr(self._conn._ensure_real().execute(self._sql), name)
 
 
+def _connect_duck_single_thread(orig_connect):
+    try:
+        return orig_connect(config={"threads": 1})
+    except TypeError:
+        return orig_connect()
+
+
 class _CachedDuckConn:
     """Read-through DuckDB connection cache keyed by DDL history and SQL."""
 
@@ -758,7 +877,7 @@ class _CachedDuckConn:
 
     def _ensure_real(self):
         if self._real is None:
-            self._real = self._orig_connect()
+            self._real = _connect_duck_single_thread(self._orig_connect)
             for d in self._ddl:
                 self._real.execute(_OPTIMIZER_INIT_DDL if d == "__TEST_OPTIMIZER_CONN__" else d)
         return self._real
@@ -819,7 +938,7 @@ def _install_lazy_optimizer_conn(cls) -> None:
                         init_ddl="__TEST_OPTIMIZER_CONN__",
                     )
                 else:
-                    conn = orig_connect()
+                    conn = _connect_duck_single_thread(orig_connect)
                     conn.execute(_OPTIMIZER_INIT_DDL)
                 target._real_conn = conn
             return conn
@@ -867,6 +986,10 @@ def _patch_test_executor_with_cache(
         or k
         in (
             "sqlglot/planner.py",
+            "sqlglot/serde.py",
+            "sqlglot/parser.py",
+            "sqlglot/tokens.py",
+            "sqlglot/tokenizer_core.py",
             "sqlglot/dialects/python.py",
             "sqlglot/generators/python.py",
             "sqlglot/generator.py",
@@ -933,6 +1056,7 @@ def _patch_test_executor_with_cache(
                     _TPCDS_OPT_VERIFIED
                     and (not executor_touched or can_use_py_hash)
                     and not opt_touched
+                    and duck_sql == tpcds_duck_sqls.get(i)
                     and tpcds_opt_dumps
                     and i in tpcds_opt_dumps
                     and i > 0
@@ -1044,6 +1168,7 @@ def _install_optimizer_accelerators(
         not getattr(cls, "_in_nulls_patched", False)
         and _TPC_CACHE is not None
         and "in_nulls_opt_duck" in _TPC_CACHE
+        and "tests/test_optimizer.py" not in pfiles
         and not any("duckdb" in k for k in pfiles)
     ):
         cls._in_nulls_patched = True
@@ -1094,7 +1219,8 @@ def _install_optimizer_accelerators(
     if (
         not getattr(cls, "_scope_patched", False)
         and not any(
-            k
+            k.startswith("sqlglot/expressions/")
+            or k
             in (
                 "sqlglot/optimizer/scope.py",
                 "sqlglot/parser.py",
@@ -1102,6 +1228,9 @@ def _install_optimizer_accelerators(
                 "sqlglot/tokenizer_core.py",
                 "sqlglot/parsers/hive.py",
                 "sqlglot/dialects/hive.py",
+                "sqlglot/helper.py",
+                "sqlglot/dialects/dialect.py",
+                "tests/test_optimizer.py",
             )
             for k in pfiles
         )
@@ -1139,7 +1268,9 @@ def _prepare_overlay_modules(
     importlib.invalidate_caches()
 
     pfiles = patched_files or {}
-    if _PREWARMED_SQLGLOT_FILES and (set(pfiles.keys()) & _PREWARMED_SQLGLOT_FILES):
+    if (_PREWARMED_SQLGLOT_FILES and (set(pfiles.keys()) & _PREWARMED_SQLGLOT_FILES)) or any(
+        k.startswith("sqlglot/typing/") for k in pfiles
+    ):
         for k in [
             k
             for k in list(sys.modules.keys())
@@ -1148,8 +1279,17 @@ def _prepare_overlay_modules(
             sys.modules.pop(k, None)
     else:
         for k, m in list(sys.modules.items()):
-            if (k == "sqlglot" or k.startswith("sqlglot.")) and hasattr(m, "__path__"):
-                m.__path__ = [str(overlay_dir / k.replace(".", "/"))]
+            if k == "sqlglot" or k.startswith("sqlglot."):
+                if hasattr(m, "__path__"):
+                    pkg_dir = overlay_dir / k.replace(".", "/")
+                    m.__path__ = [str(pkg_dir)]
+                    init_f = pkg_dir / "__init__.py"
+                    if getattr(m, "__file__", None) and init_f.exists():
+                        m.__file__ = str(init_f)
+                elif getattr(m, "__file__", None):
+                    mod_f = overlay_dir / (k.replace(".", "/") + ".py")
+                    if mod_f.exists():
+                        m.__file__ = str(mod_f)
 
 
 def _execute_tests_in_overlay(
@@ -1423,7 +1563,7 @@ def _execute_tests_in_overlay(
                                 if read
                                 else None
                             )
-                        else:
+                        elif only_generators_changed:
                             f_read = read
                             f_write = (
                                 {
@@ -1435,17 +1575,37 @@ def _execute_tests_in_overlay(
                                 if write
                                 else None
                             )
+                        else:
+                            f_read = read
+                            f_write = write
                         return _orig(
                             self, sql, read=f_read, write=f_write, pretty=pretty, identify=identify
                         )
 
                     cls.validate_all = _scoped_validate_all
 
+                saved_dial_classes = None
+                if cls_name == "TestDialectEntryPoints":
+                    try:
+                        from sqlglot.dialects.dialect import Dialect as _DCls
+
+                        saved_dial_classes = dict(_DCls._classes)
+                    except Exception:
+                        saved_dial_classes = None
+
                 try:
                     tc = cls(mname)
                     res = unittest.TestResult()
                     tc.run(res)
                 finally:
+                    if saved_dial_classes is not None:
+                        try:
+                            from sqlglot.dialects.dialect import Dialect as _DCls
+
+                            _DCls._classes.clear()
+                            _DCls._classes.update(saved_dial_classes)
+                        except Exception:
+                            pass
                     if orig_val is not None:
                         cls.validate_all = orig_val
 
@@ -1657,8 +1817,27 @@ def _run_with_dual_exec_monitor(
         return False
 
     def _wrapper(*args, **kwargs):
-        if state["diverged"] or state["proven"] or state["in_call"]:
+        if state["diverged"] or state["proven"]:
             return f_new(*args, **kwargs)
+        if state["in_call"]:
+            state["diverged"] = True
+            try:
+                sys.monitoring.set_local_events(tool_id, f_new.__code__, 0)
+            except Exception:
+                pass
+            return f_new(*args, **kwargs)
+        if cname and args:
+            cls_type = type(args[0])
+            if not hasattr(args[0], "__dict__") or any(
+                "__slots__" in B.__dict__ and B.__dict__["__slots__"]
+                for B in cls_type.__mro__
+            ):
+                state["diverged"] = True
+                try:
+                    sys.monitoring.set_local_events(tool_id, f_new.__code__, 0)
+                except Exception:
+                    pass
+                return f_new(*args, **kwargs)
         extra_args = args[1:] if (cname and args) else args
         if not all(_is_immutable_arg(x) for x in extra_args) or not all(
             _is_immutable_arg(x) for x in kwargs.values()
@@ -1694,11 +1873,16 @@ def _run_with_dual_exec_monitor(
                         if snap is not None and post_new is not None:
                             args[0].__dict__.clear()
                             args[0].__dict__.update(post_new)
-                        if (
-                            type(res_new) is not type(res_old)
-                            or res_new != res_old
-                            or post_new != post_old
-                        ):
+                        res_ok = type(res_new) is type(res_old) and (
+                            res_new is res_old
+                            or (_is_immutable_arg(res_new) and res_new == res_old)
+                        )
+                        state_ok = post_new is None or (
+                            post_new == post_old
+                            and {k: id(v) for k, v in post_new.items()}
+                            == {k: id(v) for k, v in post_old.items()}
+                        )
+                        if not res_ok or not state_ok:
                             state["diverged"] = True
                             sys.monitoring.set_local_events(tool_id, f_new.__code__, 0)
                         else:
@@ -2142,18 +2326,23 @@ def _linux_worker_loop(
             if not line:
                 continue
             task = json.loads(line)
-            ad = set(task["active_dialects"]) if task.get("active_dialects") else None
-            cid, final_nums = _process_commit_task(
-                task["cid"],
-                task["cands"],
-                task["patched_files"],
-                base_repo,
-                overlay_dir,
-                test_by_num,
-                task["allow_heavy"],
-                warm_in_process=bool(task.get("warm", False)),
-                active_dialects=ad,
-            )
+            cid = task["cid"]
+            cands = task["cands"]
+            try:
+                ad = set(task["active_dialects"]) if task.get("active_dialects") else None
+                cid, final_nums = _process_commit_task(
+                    cid,
+                    cands,
+                    task["patched_files"],
+                    base_repo,
+                    overlay_dir,
+                    test_by_num,
+                    task["allow_heavy"],
+                    warm_in_process=bool(task.get("warm", False)),
+                    active_dialects=ad,
+                )
+            except BaseException:
+                final_nums = list(cands)
             tx.write(json.dumps({"cid": cid, "final": final_nums}) + "\n")
             tx.flush()
 
@@ -2169,6 +2358,15 @@ def _read_cgroup_cpu_seconds() -> float | None:
 
 
 def main() -> int:
+    real_stdout_fd = os.dup(1)
+    json_out = os.fdopen(real_stdout_fd, "w", encoding="utf-8", buffering=1)
+    os.dup2(2, 1)
+    sys.stdout = sys.stderr
+
+    def _emit_json(obj) -> None:
+        json_out.write(json.dumps(obj) + "\n")
+        json_out.flush()
+
     if len(sys.argv) >= 2 and sys.argv[1] == "--worker":
         global _TPC_CACHE
         _TPC_CACHE = _load_tpc_cache()
@@ -2184,7 +2382,7 @@ def main() -> int:
             False,
             ad,
         )
-        sys.stdout.write(json.dumps(failed) + "\n")
+        _emit_json(failed)
         return 0
 
     t_start = time.monotonic()
@@ -2206,7 +2404,12 @@ def main() -> int:
 
     for p in patch_paths:
         cid = p.stem
-        cands, patched_files = selector.triage_commit(p.read_text(encoding="utf-8"))
+        try:
+            cands, patched_files = selector.triage_commit(
+                p.read_text(encoding="utf-8", errors="replace")
+            )
+        except BaseException:
+            cands, patched_files = set(selector.all_test_nums), {}
         if not cands:
             immediate_outputs.append((cid, []))
         else:
@@ -2214,7 +2417,7 @@ def main() -> int:
 
     # Emit 0-candidate commits immediately
     for cid, sel in immediate_outputs:
-        print(json.dumps({"commit": cid, "workers": []}), flush=True)
+        _emit_json({"commit": cid, "workers": []})
 
     if triaged:
         os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
@@ -2269,19 +2472,22 @@ def main() -> int:
             for (cid, cands, patched_files), warm in ordered_tasks:
                 allow_heavy = (time.monotonic() - t_start) < wall_limit * 0.65
                 ad_list = _active_dialects_for(patched_files)
-                _, final_nums = _process_commit_task(
-                    cid,
-                    cands,
-                    patched_files,
-                    base_repo,
-                    overlays[0],
-                    selector.test_by_num,
-                    allow_heavy,
-                    warm_in_process=(warm and hasattr(os, "fork")),
-                    active_dialects=set(ad_list) if ad_list else None,
-                )
+                try:
+                    _, final_nums = _process_commit_task(
+                        cid,
+                        cands,
+                        patched_files,
+                        base_repo,
+                        overlays[0],
+                        selector.test_by_num,
+                        allow_heavy,
+                        warm_in_process=(warm and hasattr(os, "fork")),
+                        active_dialects=set(ad_list) if ad_list else None,
+                    )
+                except BaseException:
+                    final_nums = cands
                 workers = pack_workers(final_nums, selector.test_ms)
-                print(json.dumps({"commit": cid, "workers": workers}), flush=True)
+                _emit_json({"commit": cid, "workers": workers})
         elif hasattr(os, "fork"):
             # Pre-warm once in parent (Threads: 1 with OPENBLAS_NUM_THREADS=1) before forking
             _prewarm_libraries(base_repo)
@@ -2297,6 +2503,7 @@ def main() -> int:
                 if pid == 0:
                     os.close(p2c_w)
                     os.close(c2p_r)
+                    json_out.close()
                     for tx in worker_tx.values():
                         tx.close()
                     for rx in worker_rx.values():
@@ -2319,6 +2526,7 @@ def main() -> int:
 
             pending_iter = iter(ordered_tasks)
             active = 0
+            in_flight: dict[int, tuple[str, list[int]]] = {}
 
             def _send_next(wid: int) -> bool:
                 nonlocal active
@@ -2327,6 +2535,7 @@ def main() -> int:
                 except StopIteration:
                     return False
                 allow_heavy = (time.monotonic() - t_start) < wall_limit * 0.65
+                in_flight[wid] = (cid, cands)
                 msg = json.dumps(
                     {
                         "cid": cid,
@@ -2337,8 +2546,13 @@ def main() -> int:
                         "active_dialects": _active_dialects_for(patched_files),
                     }
                 )
-                worker_tx[wid].write(msg + "\n")
-                worker_tx[wid].flush()
+                try:
+                    worker_tx[wid].write(msg + "\n")
+                    worker_tx[wid].flush()
+                except BaseException:
+                    in_flight.pop(wid, None)
+                    _emit_json({"commit": cid, "workers": pack_workers(cands, selector.test_ms)})
+                    return _send_next(wid)
                 active += 1
                 return True
 
@@ -2352,15 +2566,32 @@ def main() -> int:
                     if not resp_line:
                         sel_io.unregister(worker_rx[wid])
                         active -= 1
+                        if wid in in_flight:
+                            fail_cid, fail_cands = in_flight.pop(wid)
+                            _emit_json(
+                                {
+                                    "commit": fail_cid,
+                                    "workers": pack_workers(fail_cands, selector.test_ms),
+                                }
+                            )
                         continue
                     active -= 1
-                    res = json.loads(resp_line)
-                    workers = pack_workers(res["final"], selector.test_ms)
-                    print(
-                        json.dumps({"commit": res["cid"], "workers": workers}),
-                        flush=True,
-                    )
+                    orig_cid, orig_cands = in_flight.pop(wid)
+                    try:
+                        res = json.loads(resp_line)
+                        out_cid = res["cid"]
+                        final_nums = res["final"]
+                    except BaseException:
+                        out_cid = orig_cid
+                        final_nums = orig_cands
+                    workers = pack_workers(final_nums, selector.test_ms)
+                    _emit_json({"commit": out_cid, "workers": workers})
                     _send_next(wid)
+
+            for (rem_cid, rem_cands, _), _ in pending_iter:
+                _emit_json(
+                    {"commit": rem_cid, "workers": pack_workers(rem_cands, selector.test_ms)}
+                )
 
             sel_io.close()
             for tx_f in worker_tx.values():
@@ -2398,7 +2629,7 @@ def main() -> int:
             with ThreadPoolExecutor(max_workers=n_workers) as tpool:
                 for cid, final_nums in tpool.map(run_one, triaged):
                     workers = pack_workers(final_nums, selector.test_ms)
-                    print(json.dumps({"commit": cid, "workers": workers}), flush=True)
+                    _emit_json({"commit": cid, "workers": workers})
 
         shutil.rmtree(work_root, ignore_errors=True)
 
