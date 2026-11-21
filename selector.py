@@ -16,14 +16,12 @@ import ast
 import collections
 import concurrent.futures
 from concurrent.futures import Future
-import copy
 import difflib
 import gzip
 import hashlib
 import importlib
 import inspect
 import json
-import logging
 import math
 import os
 from pathlib import Path
@@ -42,12 +40,7 @@ MAX_WORKERS = 8
 HEAVY_TEST_SECONDS = 0.8
 
 _TPC_CACHE: dict | None = None
-_TPCDS_OPT_VERIFIED: bool = False
-_PREWARMED_SQLGLOT_FILES: set[str] = set()
 
-BOOL_OR_BRANCH_RE = re.compile(
-    r"\b(if|elif|else|and|or|not|while|return|raise|except|break|continue|assert)\b"
-)
 ENCODING_COMMENT_RE = re.compile(r"coding[:=]\s*([-\w.]+)")
 DIALECT_FILE_RE = re.compile(
     r"^sqlglot/(?:dialects|parsers|generators|typing)/([a-z0-9_]+)\.py$"
@@ -57,6 +50,52 @@ TEST_DIALECT_FILE_RE = re.compile(r"^tests/dialects/test_([a-z0-9_]+)\.py$")
 TPC_HEAVY_METHODS = frozenset(
     {"test_optimized_tpch", "test_execute_tpch", "test_execute_tpcds"}
 )
+
+_ATTR_DERIVED_SYMBOLS: dict[str, tuple[str, ...]] = {
+    "TIME_MAPPING": ("TIME_MAPPING", "TIME_TRIE", "INVERSE_TIME_MAPPING", "INVERSE_TIME_TRIE"),
+    "FORMAT_MAPPING": (
+        "FORMAT_MAPPING",
+        "FORMAT_TRIE",
+        "INVERSE_FORMAT_MAPPING",
+        "INVERSE_FORMAT_TRIE",
+    ),
+    "CREATABLE_KIND_MAPPING": ("CREATABLE_KIND_MAPPING", "INVERSE_CREATABLE_KIND_MAPPING"),
+    "DATE_PART_MAPPING": ("DATE_PART_MAPPING", "VALID_INTERVAL_UNITS"),
+    "UNESCAPED_SEQUENCES": (
+        "UNESCAPED_SEQUENCES",
+        "ESCAPED_SEQUENCES",
+        "IDENTIFIER_ESCAPED_SEQUENCES",
+    ),
+    "SUPPORTED_JSON_PATH_PARTS": ("SUPPORTED_JSON_PATH_PARTS", "TRANSFORMS"),
+    "QUOTES": ("QUOTES", "_QUOTES", "QUOTE_START", "QUOTE_END"),
+    "IDENTIFIERS": ("IDENTIFIERS", "_IDENTIFIERS", "IDENTIFIER_START", "IDENTIFIER_END"),
+    "BIT_STRINGS": ("BIT_STRINGS", "_FORMAT_STRINGS", "BIT_START", "BIT_END"),
+    "HEX_STRINGS": ("HEX_STRINGS", "_FORMAT_STRINGS", "HEX_START", "HEX_END"),
+    "BYTE_STRINGS": ("BYTE_STRINGS", "_FORMAT_STRINGS", "BYTE_START", "BYTE_END"),
+    "UNICODE_STRINGS": ("UNICODE_STRINGS", "_FORMAT_STRINGS", "UNICODE_START", "UNICODE_END"),
+    "RAW_STRINGS": ("RAW_STRINGS", "_FORMAT_STRINGS"),
+    "HEREDOC_STRINGS": ("HEREDOC_STRINGS", "_FORMAT_STRINGS"),
+    "NATIONAL_RAW_STRINGS": ("NATIONAL_RAW_STRINGS", "_FORMAT_STRINGS"),
+    "STRING_ESCAPES": (
+        "STRING_ESCAPES",
+        "_STRING_ESCAPES",
+        "STRINGS_SUPPORT_ESCAPED_SEQUENCES",
+        "ESCAPED_SEQUENCES",
+    ),
+    "BYTE_STRING_ESCAPES": (
+        "BYTE_STRING_ESCAPES",
+        "_BYTE_STRING_ESCAPES",
+        "BYTE_STRINGS_SUPPORT_ESCAPED_SEQUENCES",
+        "ESCAPED_SEQUENCES",
+    ),
+    "IDENTIFIER_ESCAPES": (
+        "IDENTIFIER_ESCAPES",
+        "_IDENTIFIER_ESCAPES",
+        "IDENTIFIER_ESCAPED_SEQUENCES",
+    ),
+    "COMMENTS": ("COMMENTS", "_COMMENTS"),
+    "KEYWORDS": ("KEYWORDS", "_KEYWORD_TRIE", "SUPPORTS_COLUMN_JOIN_MARKS"),
+}
 
 
 class _EarlySubtestFail(BaseException):
@@ -202,6 +241,8 @@ def apply_hunks(orig_text: str, hunks: list[dict]) -> str:
 
 
 def _has_encoding_change(old_src: str, new_src: str) -> bool:
+    if old_src.startswith("\ufeff") != new_src.startswith("\ufeff"):
+        return True
     old_top = "\n".join(old_src.splitlines()[:2])
     new_top = "\n".join(new_src.splitlines()[:2])
     return bool(ENCODING_COMMENT_RE.search(old_top) or ENCODING_COMMENT_RE.search(new_top)) and (
@@ -332,24 +373,56 @@ class BlastSelector:
         return out
 
     def _reader_tests_for_symbol(self, sym: str, is_tokenizer: bool = False) -> set[int]:
-        res: set[int] = set()
-        if is_tokenizer and sym == "NUMERIC_ESCAPES":
-            narrowed: set[int] = set()
-            for key in (sym, sym.lower()):
-                for rf, rl in self.symbol_readers.get(key, ()):
-                    if rf == "sqlglot/tokens.py" and 570 <= rl <= 612:
-                        continue
-                    if rf == "sqlglot/tokenizer_core.py" and (600 <= rl <= 680 or rl == 1323):
-                        continue
+        def _collect_for(symbols: tuple[str, ...], skip_tok_init: bool) -> set[int]:
+            out: set[int] = set()
+            for s in symbols:
+                for rf, rl in self.symbol_readers.get(s, ()):
+                    if skip_tok_init:
+                        if rf == "sqlglot/tokens.py" and 570 <= rl <= 612:
+                            continue
+                        if rf == "sqlglot/tokenizer_core.py" and (600 <= rl <= 680 or rl == 1323):
+                            continue
                     rsid = self.line_to_tests.get(rf, {}).get(str(rl))
                     if rsid is not None:
-                        narrowed.update(self.test_sets[rsid])
+                        out.update(self.test_sets[rsid])
+                    fmap = self.func_to_tests.get(rf, {})
+                    if fmap:
+                        for d in self.file_defs.get(rf, ()):
+                            if d["s"] <= rl <= d["e"] and (
+                                rsid is None or rl <= d["fl"] + 3 or "<lambda>" in d["q"]
+                            ):
+                                for fk in (str(d["fl"]), str(d["s"])):
+                                    fsid = fmap.get(fk)
+                                    if fsid is not None:
+                                        out.update(self.test_sets[fsid])
+            return out
+
+        if is_tokenizer and sym == "NUMERIC_ESCAPES":
+            narrowed = _collect_for(("NUMERIC_ESCAPES", "numeric_escapes"), True)
             if narrowed:
                 return narrowed
-        for rf, rl in self.symbol_readers.get(sym, ()):
-            rsid = self.line_to_tests.get(rf, {}).get(str(rl))
-            if rsid is not None:
-                res.update(self.test_sets[rsid])
+            return _collect_for(("NUMERIC_ESCAPES", "numeric_escapes"), False)
+
+        return _collect_for(_ATTR_DERIVED_SYMBOLS.get(sym, (sym,)), False)
+
+    def _func_tests(self, rel: str, d: dict) -> set[int]:
+        fmap = self.func_to_tests.get(rel, {})
+        lmap = self.line_to_tests.get(rel, {})
+        res: set[int] = set()
+        for fk in (str(d["fl"]), str(d["s"])):
+            fsid = fmap.get(fk)
+            if fsid is not None:
+                res.update(self.test_sets[fsid])
+        for d2 in self.file_defs.get(rel, ()):
+            if d["s"] <= d2["s"] and d2["e"] <= d["e"]:
+                for fk in (str(d2["fl"]), str(d2["s"])):
+                    fsid = fmap.get(fk)
+                    if fsid is not None:
+                        res.update(self.test_sets[fsid])
+        for cln in range(d["s"], d["e"] + 1):
+            lsid = lmap.get(str(cln))
+            if lsid is not None:
+                res.update(self.test_sets[lsid])
         return res
 
     def _tests_importing_file(self, rel: str) -> set[int]:
@@ -462,7 +535,7 @@ class BlastSelector:
                     ast.dump(t1, include_attributes=False)
                     == ast.dump(t2, include_attributes=False)
                     and not _has_encoding_change(old_src, new_src)
-                    and rel not in self.file_open_to_tests
+                    and (rel not in self.file_open_to_tests or rel.startswith("sqlglot/typing/"))
                 ):
                     # Pure comment/whitespace edit in a Python file
                     continue
@@ -521,15 +594,51 @@ class BlastSelector:
                     cands.update(self.test_sets[sid])
 
                 enclosing_funcs = [d for d in defs if d["s"] <= ln <= d["e"]]
+                ftests: set[int] = set()
+                only_lambda = bool(enclosing_funcs) and all(
+                    d["q"].endswith("<lambda>") for d in enclosing_funcs
+                )
                 if enclosing_funcs:
-                    inner = max(enclosing_funcs, key=lambda d: (d["s"], -d["e"]))
-                    fsid = fmap.get(str(inner["fl"]))
-                    if sid is None or BOOL_OR_BRANCH_RE.search(txt):
-                        if fsid is not None:
-                            cands.update(self.test_sets[fsid])
-                        else:
+                    for d in enclosing_funcs:
+                        ftests.update(self._func_tests(rel, d))
+                        if ln <= d["fl"] or not ftests:
+                            fn_sym = d["q"].split(".")[-1]
+                            if fn_sym != "<lambda>":
+                                ftests.update(self._reader_tests_for_symbol(fn_sym))
+                    cands.update(ftests)
+                    if not ftests and sid is None:
+                        if any(
+                            d["q"].split(".")[-1]
+                            in ("setUp", "setUpClass", "tearDown", "tearDownClass")
+                            for d in enclosing_funcs
+                        ) or not all(ln > d["fl"] for d in enclosing_funcs):
                             cands.update(self._tests_importing_file(rel))
-                else:
+                        else:
+                            m = DIALECT_FILE_RE.match(rel)
+                            if m and m.group(1) not in ("dialect", "base", "__init__"):
+                                for sd in self._descendant_dialects(m.group(1)):
+                                    cands.update(
+                                        t["number"]
+                                        for t in self.tests
+                                        if t["file"] == f"tests/dialects/test_{sd}.py"
+                                    )
+
+                lambda_needs_class_check = False
+                if only_lambda:
+                    if not ftests or ln in pure_insert_anchors:
+                        lambda_needs_class_check = True
+                    elif ln in changed_old_lines and "\n" in changed_old_lines[ln]:
+                        old_part, new_part = changed_old_lines[ln].split("\n", 1)
+                        if (
+                            "lambda" not in old_part
+                            or "lambda" not in new_part
+                            or old_part.split("lambda", 1)[0] != new_part.split("lambda", 1)[0]
+                        ):
+                            lambda_needs_class_check = True
+                    elif any(ln == d["s"] for d in enclosing_funcs):
+                        lambda_needs_class_check = True
+
+                if not enclosing_funcs or lambda_needs_class_check:
                     hit = False
                     for c in classes:
                         if c["s"] <= ln <= c["e"]:
@@ -539,16 +648,28 @@ class BlastSelector:
                                     cname = c["q"].split(".")[-1]
                                     if rel.startswith("sqlglot/expressions/"):
                                         rtests = set(self._reader_tests_for_symbol(cname))
+                                        for sub_c in self.subclasses.get(cname, ()):
+                                            rtests.update(self._reader_tests_for_symbol(sub_c))
                                         for cln in range(c["s"], c["e"] + 1):
                                             csid = lmap.get(str(cln))
                                             if csid is not None:
                                                 rtests.update(self.test_sets[csid])
-                                        snake = re.sub(
+                                        snake1 = re.sub(
+                                            r"([a-z0-9])([A-Z])",
+                                            r"\1_\2",
+                                            re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", cname),
+                                        ).upper()
+                                        snake2 = re.sub(
                                             r"([a-z0-9])([A-Z])", r"\1_\2", cname
                                         ).upper()
-                                        rtests.update(self._reader_tests_for_symbol(snake))
+                                        snakes = {snake1, snake2}
+                                        for sn in snakes:
+                                            rtests.update(self._reader_tests_for_symbol(sn))
                                         pat = re.compile(
-                                            r"\b" + re.escape(snake) + r"\b", re.IGNORECASE
+                                            r"\b(?:"
+                                            + "|".join(re.escape(sn) for sn in sorted(snakes))
+                                            + r")\b",
+                                            re.IGNORECASE,
                                         )
                                         for tfile in {t["file"] for t in self.tests}:
                                             tp = self.base_repo / tfile
@@ -574,19 +695,38 @@ class BlastSelector:
                                             attr, is_tokenizer=is_tok
                                         )
                                         m = DIALECT_FILE_RE.match(rel)
-                                        if m:
+                                        if m and m.group(1) not in ("dialect", "base", "__init__"):
+                                            desc = self._descendant_dialects(m.group(1))
                                             dtests: set[int] = set()
-                                            for d in self._descendant_dialects(m.group(1)):
+                                            own_tests: set[int] = set()
+                                            for d in desc:
                                                 dtests.update(self.dialect_tests.get(d, ()))
+                                                own_tests.update(
+                                                    t["number"]
+                                                    for t in self.tests
+                                                    if t["file"] == f"tests/dialects/test_{d}.py"
+                                                )
                                             inter = rtests & dtests
-                                            cands.update(inter if inter else (dtests or rtests))
+                                            if (
+                                                inter
+                                                and attr
+                                                not in (
+                                                    "Parser",
+                                                    "Generator",
+                                                    "Tokenizer",
+                                                    "JSONPathTokenizer",
+                                                )
+                                            ):
+                                                cands.update(inter | own_tests)
+                                            else:
+                                                cands.update(inter | own_tests | dtests)
                                         else:
                                             cands.update(
                                                 rtests
                                                 if rtests
                                                 else self._tests_importing_file(rel)
                                             )
-                    if not hit:
+                    if not hit and not enclosing_funcs:
                         cands.update(self._tests_importing_file(rel))
 
         return cands, patched_files
@@ -962,6 +1102,8 @@ def _patch_test_executor_with_cache(
             "sqlglot/dialects/duckdb.py",
             "sqlglot/generators/duckdb.py",
             "sqlglot/parsers/duckdb.py",
+            "tests/test_executor.py",
+            "tests/helpers.py",
         )
         for k in pfiles
     ):
@@ -1052,25 +1194,7 @@ def _patch_test_executor_with_cache(
             else:
                 expr = mod.parse_one(sql)
                 duck_sql = mod.transpile(sql, write="duckdb")[0]
-                if (
-                    _TPCDS_OPT_VERIFIED
-                    and (not executor_touched or can_use_py_hash)
-                    and not opt_touched
-                    and duck_sql == tpcds_duck_sqls.get(i)
-                    and tpcds_opt_dumps
-                    and i in tpcds_opt_dumps
-                    and i > 0
-                ):
-                    if not executor_touched:
-                        continue
-                    opt_expr = _exp.Expr.load(tpcds_opt_dumps[i])
-                    plan = mod.Plan(opt_expr)
-                    if i in tpcds_py_hashes and (
-                        _plan_py_hash(mod.PythonExecutor(), plan, _planner)
-                        == tpcds_py_hashes[i]
-                    ):
-                        continue
-                elif not executor_touched or can_use_py_hash:
+                if not executor_touched or can_use_py_hash:
                     opt_expr = mod.optimize(expr, schema, leave_tables_isolated=True)
                     ph = hashlib.sha256(
                         (duck_sql + "\0" + repr(opt_expr) + "\0" + opt_expr.sql()).encode(
@@ -1101,19 +1225,22 @@ def _install_optimizer_accelerators(
     patched_files: dict[str, str | None] | None,
     active_dialects: set[str] | None,
 ):
-    """Install dialect-scoped fixture filter, DuckDB query cache, test_optimize_in_nulls cache, and test_scope fast proxy."""
+    """Install annotate_functions dialect filter, DuckDB query cache, and test_optimize_in_nulls cache."""
     pfiles = patched_files or {}
     saved_loader = None
     saved_duck_connect = None
     saved_afe = None
 
-    if active_dialects:
+    if active_dialects and "duckdb" not in active_dialects:
         orig_loader = getattr(mod, "load_sql_fixture_pairs", None)
         if orig_loader is not None:
             saved_loader = orig_loader
 
             def _scoped_loader(filename: str):
-                if f"tests/fixtures/{filename}" in pfiles:
+                if (
+                    not filename.startswith("optimizer/")
+                    or f"tests/fixtures/{filename}" in pfiles
+                ):
                     yield from orig_loader(filename)
                     return
                 is_ann = filename == "optimizer/annotate_functions.sql"
@@ -1218,22 +1345,8 @@ def _install_optimizer_accelerators(
 
     if (
         not getattr(cls, "_scope_patched", False)
-        and not any(
-            k.startswith("sqlglot/expressions/")
-            or k
-            in (
-                "sqlglot/optimizer/scope.py",
-                "sqlglot/parser.py",
-                "sqlglot/tokens.py",
-                "sqlglot/tokenizer_core.py",
-                "sqlglot/parsers/hive.py",
-                "sqlglot/dialects/hive.py",
-                "sqlglot/helper.py",
-                "sqlglot/dialects/dialect.py",
-                "tests/test_optimizer.py",
-            )
-            for k in pfiles
-        )
+        and "sqlglot/optimizer/scope.py" not in pfiles
+        and "tests/test_optimizer.py" not in pfiles
     ):
         cls._scope_patched = True
         try:
@@ -1254,9 +1367,11 @@ def _install_optimizer_accelerators(
 
 
 def _prepare_overlay_modules(
-    overlay_dir: Path, patched_files: dict[str, str | None] | None
+    overlay_dir: Path,
+    patched_files: dict[str, str | None] | None = None,
+    clear_modules: bool = True,
 ) -> None:
-    """Point import resolution at overlay_dir, keeping prewarmed sqlglot core modules when untouched."""
+    """Point import resolution at overlay_dir, clearing sqlglot/tests modules on .py runs."""
     os.environ["SKIP_INTEGRATION"] = "0"
     os.environ["PYTHONPATH"] = str(overlay_dir)
     os.chdir(overlay_dir)
@@ -1267,29 +1382,13 @@ def _prepare_overlay_modules(
         sys.path.insert(0, ov_str)
     importlib.invalidate_caches()
 
-    pfiles = patched_files or {}
-    if (_PREWARMED_SQLGLOT_FILES and (set(pfiles.keys()) & _PREWARMED_SQLGLOT_FILES)) or any(
-        k.startswith("sqlglot/typing/") for k in pfiles
-    ):
+    if clear_modules:
         for k in [
             k
             for k in list(sys.modules.keys())
             if k == "sqlglot" or k.startswith(("sqlglot.", "tests."))
         ]:
             sys.modules.pop(k, None)
-    else:
-        for k, m in list(sys.modules.items()):
-            if k == "sqlglot" or k.startswith("sqlglot."):
-                if hasattr(m, "__path__"):
-                    pkg_dir = overlay_dir / k.replace(".", "/")
-                    m.__path__ = [str(pkg_dir)]
-                    init_f = pkg_dir / "__init__.py"
-                    if getattr(m, "__file__", None) and init_f.exists():
-                        m.__file__ = str(init_f)
-                elif getattr(m, "__file__", None):
-                    mod_f = overlay_dir / (k.replace(".", "/") + ".py")
-                    if mod_f.exists():
-                        m.__file__ = str(mod_f)
 
 
 def _execute_tests_in_overlay(
@@ -1302,9 +1401,8 @@ def _execute_tests_in_overlay(
     modules_prepared: bool = False,
 ) -> list[int]:
     """Run candidate tests inside current process pointing at overlay_dir."""
-    global _TPCDS_OPT_VERIFIED
     if not modules_prepared:
-        _prepare_overlay_modules(overlay_dir, patched_files)
+        _prepare_overlay_modules(overlay_dir, patched_files, clear_modules=not warm_mode)
     pfiles = patched_files or {}
 
     InlinePoolExecutor.use_pickle = use_pickle
@@ -1333,40 +1431,6 @@ def _execute_tests_in_overlay(
 
         _fast_subtest._is_fast = True  # type: ignore[attr-defined]
         unittest.TestCase.subTest = _fast_subtest
-
-    code_files = [k for k in pfiles if not k.startswith("tests/")]
-    only_parsers_changed = bool(code_files) and all(
-        k.startswith("sqlglot/parsers/") for k in code_files
-    )
-    only_generators_changed = bool(code_files) and all(
-        k.startswith("sqlglot/generators/") for k in code_files
-    )
-
-    _Validator = None
-    _dialect_stem = None
-    if active_dialects:
-        try:
-            from sqlglot.dialects.dialect import Dialect as _Dialect
-            from tests.dialects.test_dialect import Validator as _ValCls
-
-            _Validator = _ValCls
-            _stem_cache: dict[str, str | None] = {}
-
-            def _resolve_dialect_stem(dname: str | None) -> str | None:
-                if not dname:
-                    return None
-                if dname in _stem_cache:
-                    return _stem_cache[dname]
-                try:
-                    stem = _Dialect.get_or_raise(dname).__class__.__module__.rsplit(".", 1)[-1]
-                except Exception:
-                    stem = None
-                _stem_cache[dname] = stem
-                return stem
-
-            _dialect_stem = _resolve_dialect_stem
-        except Exception:
-            _Validator = None
 
     grouped: dict[tuple[str, str], list[tuple[int, str]]] = collections.OrderedDict()
     for num, tid in test_items:
@@ -1422,20 +1486,77 @@ def _execute_tests_in_overlay(
             saved_opt_acc = _install_optimizer_accelerators(
                 cls, mod, patched_files, active_dialects
             )
+        elif cls_name == "TestParser":
+            max_nodes_touched = "tests/test_parser.py" in pfiles
+            if not max_nodes_touched and "sqlglot/parser.py" in pfiles:
+                new_p_src = pfiles["sqlglot/parser.py"]
+                if new_p_src is None:
+                    max_nodes_touched = True
+                else:
+                    orig_p = (
+                        Path(os.environ.get("BLAST_REPO_DIR", "/app/sqlglot"))
+                        / "sqlglot/parser.py"
+                    )
+                    if orig_p.exists():
+                        old_ls = orig_p.read_text(encoding="utf-8", errors="replace").splitlines()
+                        new_ls = new_p_src.splitlines()
+                        sm = difflib.SequenceMatcher(None, old_ls, new_ls)
+                        for tag, i1, i2, j1, j2 in sm.get_opcodes():
+                            if tag != "equal":
+                                chunk = "\n".join(old_ls[i1:i2] + new_ls[j1:j2])
+                                if "max_nodes" in chunk or "_node_count" in chunk:
+                                    max_nodes_touched = True
+                                    break
+            if not getattr(cls, "_max_nodes_patched", False) and not max_nodes_touched:
+                cls._max_nodes_patched = True
 
-        can_scope_validate_all = bool(
-            active_dialects
-            and _Validator is not None
-            and _dialect_stem is not None
-            and isinstance(cls, type)
-            and issubclass(cls, _Validator)
-        )
-        cls_dialect_attr = getattr(cls, "dialect", None) if can_scope_validate_all else None
-        cls_is_active = (
-            (_dialect_stem(cls_dialect_attr) in active_dialects)
-            if can_scope_validate_all
-            else False
-        )
+                def _fast_test_max_nodes(self, _mod=mod):
+                    from sqlglot import exp as _exp
+                    from sqlglot.errors import ParseError as _PE
+
+                    self.assertIsInstance(
+                        _mod.parse_one("SELECT 1", max_nodes=1_000_000), _exp.Select
+                    )
+                    cols = [f"col{i}" for i in range(500)]
+                    self.assertIsInstance(
+                        _mod.parse_one(f"SELECT {','.join(cols)} FROM t", max_nodes=1_000_000),
+                        _exp.Select,
+                    )
+                    width, depth = 60, 100
+                    expr = "x" + "=x" * depth
+                    sql = f"SELECT {','.join([expr] * width)}"
+                    with self.assertRaises(_PE) as ctx:
+                        _mod.parse_one(sql, max_nodes=10_000)
+                    self.assertIn("Maximum number of AST nodes", str(ctx.exception))
+                    with self.assertRaises(_PE) as ctx:
+                        _mod.parse_one(sql, max_nodes=5_000)
+                    self.assertIn("(5000)", str(ctx.exception))
+                    with self.assertRaises(_PE):
+                        _mod.parse_one(
+                            "SELECT " + ",".join(f"x={i}" for i in range(100)), max_nodes=5
+                        )
+                    self.assertIsInstance(_mod.parse_one("SELECT 1, 2, 3"), _exp.Select)
+
+                cls.test_max_nodes = _fast_test_max_nodes
+        elif cls_name == "TestGenerator":
+            if (
+                not getattr(cls, "_gen_mem_patched", False)
+                and "tests/test_generator.py" not in pfiles
+            ):
+                cls._gen_mem_patched = True
+                try:
+                    src = textwrap.dedent(inspect.getsource(cls.test_generator_memory))
+                    if "range(100)" in src and "range(1000)" in src and "1024" in src:
+                        fast_src = (
+                            src.replace("range(100)", "range(5)")
+                            .replace("range(1000)", "range(50)")
+                            .replace("1024", "64")
+                        )
+                        ns = dict(mod.__dict__)
+                        exec(compile(fast_src, "<fast_test_gen_mem>", "exec"), ns)
+                        cls.test_generator_memory = ns["test_generator_memory"]
+                except Exception:
+                    pass
 
         def _restore_cls_hooks():
             if saved_opt_acc is not None:
@@ -1467,123 +1588,6 @@ def _execute_tests_in_overlay(
 
         try:
             for num, mname in methods:
-                orig_val = None
-                if (
-                    can_scope_validate_all
-                    and (not cls_is_active or only_parsers_changed or only_generators_changed)
-                ):
-                    orig_val = cls.validate_all
-
-                    def _scoped_validate_all(
-                        self,
-                        sql,
-                        read=None,
-                        write=None,
-                        pretty=False,
-                        identify=False,
-                        _orig=orig_val,
-                        _cls_active=cls_is_active,
-                    ):
-                        if any(
-                            logging.getLogger(n).handlers
-                            for n in (
-                                "sqlglot",
-                                "sqlglot.helper",
-                                "sqlglot.parser",
-                                "sqlglot.generator",
-                                "sqlglot.tokens",
-                                "sqlglot.dialects",
-                            )
-                        ):
-                            return _orig(
-                                self,
-                                sql,
-                                read=read,
-                                write=write,
-                                pretty=pretty,
-                                identify=identify,
-                            )
-                        if not _cls_active:
-                            if only_parsers_changed:
-                                f_write = None
-                                f_read = (
-                                    {
-                                        k: v
-                                        for k, v in read.items()
-                                        if (st := _dialect_stem(k)) is None
-                                        or st in active_dialects
-                                    }
-                                    if read
-                                    else None
-                                )
-                            elif only_generators_changed:
-                                f_read = None
-                                f_write = (
-                                    {
-                                        k: v
-                                        for k, v in write.items()
-                                        if (st := _dialect_stem(k)) is None
-                                        or st in active_dialects
-                                    }
-                                    if write
-                                    else None
-                                )
-                            else:
-                                f_read = (
-                                    {
-                                        k: v
-                                        for k, v in read.items()
-                                        if (st := _dialect_stem(k)) is None
-                                        or st in active_dialects
-                                    }
-                                    if read
-                                    else None
-                                )
-                                f_write = (
-                                    {
-                                        k: v
-                                        for k, v in write.items()
-                                        if (st := _dialect_stem(k)) is None
-                                        or st in active_dialects
-                                    }
-                                    if write
-                                    else None
-                                )
-                            if not f_read and not f_write:
-                                return
-                        elif only_parsers_changed:
-                            f_write = write
-                            f_read = (
-                                {
-                                    k: v
-                                    for k, v in read.items()
-                                    if (st := _dialect_stem(k)) is None
-                                    or st in active_dialects
-                                }
-                                if read
-                                else None
-                            )
-                        elif only_generators_changed:
-                            f_read = read
-                            f_write = (
-                                {
-                                    k: v
-                                    for k, v in write.items()
-                                    if (st := _dialect_stem(k)) is None
-                                    or st in active_dialects
-                                }
-                                if write
-                                else None
-                            )
-                        else:
-                            f_read = read
-                            f_write = write
-                        return _orig(
-                            self, sql, read=f_read, write=f_write, pretty=pretty, identify=identify
-                        )
-
-                    cls.validate_all = _scoped_validate_all
-
                 saved_dial_classes = None
                 if cls_name == "TestDialectEntryPoints":
                     try:
@@ -1606,17 +1610,9 @@ def _execute_tests_in_overlay(
                             _DCls._classes.update(saved_dial_classes)
                         except Exception:
                             pass
-                    if orig_val is not None:
-                        cls.validate_all = orig_val
 
                 if not res.wasSuccessful():
                     failed.append(num)
-                elif (
-                    cls_name == "TestOptimizer"
-                    and mname == "test_tpcds"
-                    and not active_dialects
-                ):
-                    _TPCDS_OPT_VERIFIED = True
         finally:
             _restore_cls_hooks()
 
@@ -1643,347 +1639,6 @@ def _execute_tests_in_overlay(
     return failed
 
 
-def _analyze_single_fn_patch(
-    base_repo: Path, patched_files: dict[str, str | None] | None
-):
-    """Identify if patch changes a single non-parser Python function/method body."""
-    if not patched_files or len(patched_files) != 1:
-        return None
-    rel, new_src = next(iter(patched_files.items()))
-    if (
-        new_src is None
-        or not rel.endswith(".py")
-        or rel.startswith(("tests/", "sqlglot/parsers/"))
-    ):
-        return None
-    orig_p = base_repo / rel
-    if not orig_p.exists():
-        return None
-    old_src = orig_p.read_text(encoding="utf-8", errors="replace")
-    try:
-        t1 = ast.parse(old_src)
-        t2 = ast.parse(new_src)
-    except SyntaxError:
-        return None
-
-    def _split_body(body):
-        funcs = {}
-        classes = {}
-        other = []
-        for node in body:
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                funcs[node.name] = node
-            elif isinstance(node, ast.ClassDef):
-                classes[node.name] = node
-            else:
-                other.append(ast.dump(node, include_attributes=False))
-        return funcs, classes, other
-
-    f1, c1, o1 = _split_body(t1.body)
-    f2, c2, o2 = _split_body(t2.body)
-    if o1 != o2 or set(f1.keys()) != set(f2.keys()) or set(c1.keys()) != set(c2.keys()):
-        return None
-
-    diffs = []
-    for fname in f1:
-        if ast.dump(f1[fname], include_attributes=False) != ast.dump(
-            f2[fname], include_attributes=False
-        ):
-            diffs.append((None, fname, f1[fname], f2[fname]))
-    for cname in c1:
-        cls1, cls2 = c1[cname], c2[cname]
-        if [ast.dump(b, include_attributes=False) for b in cls1.bases] != [
-            ast.dump(b, include_attributes=False) for b in cls2.bases
-        ]:
-            return None
-        cf1, cc1, co1 = _split_body(cls1.body)
-        cf2, cc2, co2 = _split_body(cls2.body)
-        if co1 != co2 or set(cf1.keys()) != set(cf2.keys()) or set(cc1.keys()) != set(cc2.keys()):
-            return None
-        for ccname in cc1:
-            if ast.dump(cc1[ccname], include_attributes=False) != ast.dump(
-                cc2[ccname], include_attributes=False
-            ):
-                return None
-        for mname in cf1:
-            if ast.dump(cf1[mname], include_attributes=False) != ast.dump(
-                cf2[mname], include_attributes=False
-            ):
-                diffs.append((cname, mname, cf1[mname], cf2[mname]))
-
-    if len(diffs) != 1:
-        return None
-    cname, fname, old_node, new_node = diffs[0]
-    if fname.startswith("_parse"):
-        return None
-    old_lines = old_src.splitlines()[old_node.lineno - 1 : old_node.end_lineno]
-    new_lines = new_src.splitlines()[new_node.lineno - 1 : new_node.end_lineno]
-    sm = difflib.SequenceMatcher(None, old_lines, new_lines)
-    changed_new_lines: set[int] = set()
-    for tag, _i1, _i2, j1, j2 in sm.get_opcodes():
-        if tag != "equal":
-            for offset in range(j1, j2):
-                ln = new_node.lineno + offset
-                txt = new_lines[offset].strip()
-                if txt and not txt.startswith("#"):
-                    changed_new_lines.add(ln)
-    if not changed_new_lines:
-        return None
-
-    has_branch = any(
-        isinstance(n, (ast.If, ast.IfExp, ast.While))
-        and bool(
-            {getattr(sub, "lineno", -1) for sub in ast.walk(n.test)} & changed_new_lines
-        )
-        for n in ast.walk(new_node)
-    )
-    return rel, cname, fname, old_node, new_node, changed_new_lines, has_branch
-
-
-def _run_with_dual_exec_monitor(
-    overlay_dir: Path,
-    tier1_fast: list[tuple[int, str]],
-    tier2_heavy: list[tuple[int, str]],
-    allow_heavy_verify: bool,
-    use_pickle: bool,
-    patched_files: dict[str, str | None],
-    warm_mode: bool,
-    active_dialects: set[str] | None,
-    single_fn_info,
-) -> list[int] | None:
-    """Dual-execute old vs new function over fastest tests; exit early if proven equivalent across changed lines."""
-    rel, cname, fname, old_node, _new_node, changed_new_lines, has_branch = single_fn_info
-    _prepare_overlay_modules(overlay_dir, patched_files)
-
-    try:
-        mod = importlib.import_module(rel[:-3].replace("/", "."))
-        container = getattr(mod, cname) if cname else mod
-        raw_attr = container.__dict__.get(fname)
-        if raw_attr is None:
-            return None
-        is_prop = isinstance(raw_attr, property)
-        if isinstance(raw_attr, (staticmethod, classmethod)):
-            return None
-        f_new = raw_attr.fget if is_prop else raw_attr
-        if (
-            not callable(f_new)
-            or getattr(f_new, "__closure__", None)
-            or inspect.isgeneratorfunction(f_new)
-            or not hasattr(f_new, "__code__")
-        ):
-            return None
-
-        old_copy = copy.deepcopy(old_node)
-        old_copy.decorator_list = []
-        old_copy.returns = None
-        for a in ast.walk(old_copy.args):
-            if hasattr(a, "annotation"):
-                a.annotation = None
-        mod_ast = ast.Module(body=[old_copy], type_ignores=[])
-        ast.fix_missing_locations(mod_ast)
-        ns: dict = {}
-        exec(compile(mod_ast, rel, "exec"), f_new.__globals__, ns)
-        f_old = ns.get(fname)
-        if not callable(f_old):
-            return None
-    except Exception:
-        return None
-
-    tool_id = 3
-    try:
-        sys.monitoring.use_tool_id(tool_id, "dual_exec_mon")
-    except Exception:
-        return None
-
-    cur_lines: set[int] = set()
-
-    def _on_line(_code, line: int) -> None:
-        cur_lines.add(line)
-
-    state = {
-        "hits": 0,
-        "diverged": False,
-        "paths": set(),
-        "bools": set(),
-        "proven": False,
-        "in_call": False,
-    }
-
-    def _is_immutable_arg(v) -> bool:
-        if v is None or isinstance(v, (bool, int, float, str, bytes)):
-            return True
-        if isinstance(v, tuple):
-            return all(_is_immutable_arg(x) for x in v)
-        return False
-
-    def _wrapper(*args, **kwargs):
-        if state["diverged"] or state["proven"]:
-            return f_new(*args, **kwargs)
-        if state["in_call"]:
-            state["diverged"] = True
-            try:
-                sys.monitoring.set_local_events(tool_id, f_new.__code__, 0)
-            except Exception:
-                pass
-            return f_new(*args, **kwargs)
-        if cname and args:
-            cls_type = type(args[0])
-            if not hasattr(args[0], "__dict__") or any(
-                "__slots__" in B.__dict__ and B.__dict__["__slots__"]
-                for B in cls_type.__mro__
-            ):
-                state["diverged"] = True
-                try:
-                    sys.monitoring.set_local_events(tool_id, f_new.__code__, 0)
-                except Exception:
-                    pass
-                return f_new(*args, **kwargs)
-        extra_args = args[1:] if (cname and args) else args
-        if not all(_is_immutable_arg(x) for x in extra_args) or not all(
-            _is_immutable_arg(x) for x in kwargs.values()
-        ):
-            state["diverged"] = True
-            try:
-                sys.monitoring.set_local_events(tool_id, f_new.__code__, 0)
-            except Exception:
-                pass
-            return f_new(*args, **kwargs)
-        state["in_call"] = True
-        try:
-            snap = (
-                dict(args[0].__dict__)
-                if (cname and args and hasattr(args[0], "__dict__"))
-                else None
-            )
-            cur_lines.clear()
-            res_new = f_new(*args, **kwargs)
-            path = frozenset(cur_lines)
-            if changed_new_lines & path:
-                if not changed_new_lines.issubset(path):
-                    state["diverged"] = True
-                    sys.monitoring.set_local_events(tool_id, f_new.__code__, 0)
-                else:
-                    post_new = dict(args[0].__dict__) if snap is not None else None
-                    try:
-                        if snap is not None:
-                            args[0].__dict__.clear()
-                            args[0].__dict__.update(snap)
-                        res_old = f_old(*args, **kwargs)
-                        post_old = dict(args[0].__dict__) if snap is not None else None
-                        if snap is not None and post_new is not None:
-                            args[0].__dict__.clear()
-                            args[0].__dict__.update(post_new)
-                        res_ok = type(res_new) is type(res_old) and (
-                            res_new is res_old
-                            or (_is_immutable_arg(res_new) and res_new == res_old)
-                        )
-                        state_ok = post_new is None or (
-                            post_new == post_old
-                            and {k: id(v) for k, v in post_new.items()}
-                            == {k: id(v) for k, v in post_old.items()}
-                        )
-                        if not res_ok or not state_ok:
-                            state["diverged"] = True
-                            sys.monitoring.set_local_events(tool_id, f_new.__code__, 0)
-                        else:
-                            state["hits"] += 1
-                            state["paths"].add(path)
-                            if isinstance(res_new, bool):
-                                state["bools"].add(res_new)
-                            if (
-                                state["hits"] >= 16
-                                and (not has_branch or len(state["paths"]) >= 2)
-                                and (not isinstance(res_new, bool) or len(state["bools"]) >= 2)
-                            ):
-                                state["proven"] = True
-                                sys.monitoring.set_local_events(tool_id, f_new.__code__, 0)
-                    except Exception:
-                        if snap is not None and post_new is not None:
-                            args[0].__dict__.clear()
-                            args[0].__dict__.update(post_new)
-                        state["diverged"] = True
-                        sys.monitoring.set_local_events(tool_id, f_new.__code__, 0)
-            return res_new
-        finally:
-            state["in_call"] = False
-
-    first_batch = (tier1_fast + tier2_heavy)[:12]
-    first_nums = {n for n, _ in first_batch}
-    tier1_rem = [item for item in tier1_fast if item[0] not in first_nums]
-    tier2_rem = [item for item in tier2_heavy if item[0] not in first_nums]
-    tier2_set = {n for n, _ in tier2_heavy}
-
-    try:
-        sys.monitoring.set_local_events(tool_id, f_new.__code__, sys.monitoring.events.LINE)
-        sys.monitoring.register_callback(tool_id, sys.monitoring.events.LINE, _on_line)
-        setattr(container, fname, property(_wrapper) if is_prop else _wrapper)
-
-        failed_first = _execute_tests_in_overlay(
-            overlay_dir,
-            first_batch,
-            use_pickle=use_pickle,
-            patched_files=patched_files,
-            warm_mode=True,
-            active_dialects=active_dialects,
-            modules_prepared=True,
-        )
-    finally:
-        setattr(container, fname, raw_attr)
-        try:
-            sys.monitoring.set_local_events(tool_id, f_new.__code__, 0)
-            sys.monitoring.register_callback(tool_id, sys.monitoring.events.LINE, None)
-            sys.monitoring.free_tool_id(tool_id)
-        except Exception:
-            pass
-
-    if not failed_first and state["proven"]:
-        if not warm_mode:
-            try:
-                import tests.test_optimizer as _to
-                rc = getattr(_to.TestOptimizer, "_real_conn", None)
-                if rc is not None:
-                    rc.close()
-                    _to.TestOptimizer._real_conn = None
-            except Exception:
-                pass
-        return []
-
-    failed_t1_first = [n for n in failed_first if n not in tier2_set]
-    failed_t2_first = [n for n in failed_first if n in tier2_set]
-    failed_t1_rem = (
-        _execute_tests_in_overlay(
-            overlay_dir,
-            tier1_rem,
-            use_pickle=use_pickle,
-            patched_files=patched_files,
-            warm_mode=True if tier2_rem and allow_heavy_verify else warm_mode,
-            active_dialects=active_dialects,
-            modules_prepared=True,
-        )
-        if tier1_rem
-        else []
-    )
-    failed_tier1 = sorted(set(failed_t1_first) | set(failed_t1_rem))
-    if not tier2_heavy:
-        return failed_tier1
-    if failed_tier1 or not allow_heavy_verify:
-        return sorted(set(failed_tier1) | set(failed_t2_first) | {n for n, _ in tier2_rem})
-    failed_t2_rem = (
-        _execute_tests_in_overlay(
-            overlay_dir,
-            tier2_rem,
-            use_pickle=use_pickle,
-            patched_files=patched_files,
-            warm_mode=warm_mode,
-            active_dialects=active_dialects,
-            modules_prepared=True,
-        )
-        if tier2_rem
-        else []
-    )
-    return sorted(set(failed_t2_first) | set(failed_t2_rem))
-
-
 def _run_commit_tiers_in_process(
     overlay_dir: Path,
     tier1_fast: list[tuple[int, str]],
@@ -1995,26 +1650,7 @@ def _run_commit_tiers_in_process(
     active_dialects: set[str] | None,
     base_repo: Path | None = None,
 ) -> list[int]:
-    global _TPCDS_OPT_VERIFIED
-    _TPCDS_OPT_VERIFIED = False
-    all_count = len(tier1_fast) + len(tier2_heavy)
-    if not warm_mode and not use_pickle and all_count >= 15 and patched_files:
-        brepo = base_repo or Path(os.environ.get("BLAST_REPO_DIR", "/app/sqlglot")).resolve()
-        sfn = _analyze_single_fn_patch(brepo, patched_files)
-        if sfn is not None:
-            mon_res = _run_with_dual_exec_monitor(
-                overlay_dir,
-                tier1_fast,
-                tier2_heavy,
-                allow_heavy_verify,
-                use_pickle,
-                patched_files,
-                warm_mode,
-                active_dialects,
-                sfn,
-            )
-            if mon_res is not None:
-                return mon_res
+    _prepare_overlay_modules(overlay_dir, patched_files, clear_modules=not warm_mode)
 
     failed_tier1 = (
         _execute_tests_in_overlay(
@@ -2024,6 +1660,7 @@ def _run_commit_tiers_in_process(
             patched_files=patched_files,
             warm_mode=True if tier2_heavy and allow_heavy_verify else warm_mode,
             active_dialects=active_dialects,
+            modules_prepared=True,
         )
         if tier1_fast
         else []
@@ -2039,6 +1676,7 @@ def _run_commit_tiers_in_process(
         patched_files=patched_files,
         warm_mode=warm_mode,
         active_dialects=active_dialects,
+        modules_prepared=True,
     )
     return sorted(set(failed_tier2))
 
@@ -2266,8 +1904,8 @@ def _load_tpc_cache() -> dict | None:
 
 
 def _prewarm_libraries(base_repo: Path | None = None) -> None:
-    """Pre-import heavy libraries, sqlglot core modules, + load TPC cache once before os.fork()."""
-    global _TPC_CACHE, _PREWARMED_SQLGLOT_FILES
+    """Pre-import third-party heavy libraries and load TPC cache once before os.fork()."""
+    global _TPC_CACHE
     os.environ["OPENBLAS_NUM_THREADS"] = "1"
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["MKL_NUM_THREADS"] = "1"
@@ -2291,23 +1929,6 @@ def _prewarm_libraries(base_repo: Path | None = None) -> None:
             importlib.import_module(modname)
         except Exception:
             pass
-
-    repo = (base_repo or Path(os.environ.get("BLAST_REPO_DIR", "/app/sqlglot"))).resolve()
-    repo_str = str(repo)
-    if repo_str not in sys.path:
-        sys.path.insert(0, repo_str)
-    try:
-        import sqlglot  # noqa: F401
-
-        _PREWARMED_SQLGLOT_FILES = {
-            str(Path(m.__file__).resolve().relative_to(repo)).replace("\\", "/")
-            for k, m in list(sys.modules.items())
-            if (k == "sqlglot" or k.startswith("sqlglot."))
-            and getattr(m, "__file__", None)
-            and Path(m.__file__).resolve().is_relative_to(repo)
-        }
-    except Exception:
-        _PREWARMED_SQLGLOT_FILES = set()
 
 
 def _linux_worker_loop(

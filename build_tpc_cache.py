@@ -144,9 +144,10 @@ def main() -> int:
                 tpcds_opt_dumps[i] = serde_dump(opt_expr)
                 tpcds_py_hashes[i] = _plan_py_hash(PythonExecutor(), plan, planner)
 
-        # Build coverage-preserving pruned TPC-DS tables (keep first 48 rows per table + up to 4 matches per Scan filter)
+        # Build coverage-preserving pruned TPC-DS tables (keep first 48 rows per table + up to 8 matches per Scan filter)
         raw_full = {name: (tbl.columns, tbl.rows) for name, tbl in te.TestExecutor.tpcds_tables.items()}
-        rows_id_to_name = {id(tbl.rows): name for name, tbl in te.TestExecutor.tpcds_tables.items()}
+        for name, tbl in te.TestExecutor.tpcds_tables.items():
+            tbl._orig_tname = name
         keep_indices = {
             name: set(range(min(len(tbl.rows), 48)))
             for name, tbl in te.TestExecutor.tpcds_tables.items()
@@ -155,21 +156,23 @@ def main() -> int:
         orig_pf = PythonExecutor._project_and_filter
 
         def _trace_pf(self, context, step, iterator):
-            if step.condition and len(context.tables) == 1:
-                t = next(iter(context.tables.values()))
-                tname = rows_id_to_name.get(id(t.rows))
-                if tname is not None:
-                    cond = self.generate(step.condition)
-                    matched = 0
-                    reader = t.reader
-                    for idx, row in enumerate(t.rows):
-                        reader.row = row
-                        if context.eval(cond):
-                            keep_indices[tname].add(idx)
-                            matched += 1
-                            if matched >= 4:
-                                break
-            return orig_pf(self, context, step, iterator)
+            t = next(iter(context.tables.values())) if len(context.tables) == 1 else None
+            tname = getattr(t, "_orig_tname", None) if t is not None else None
+            if step.condition and tname is not None:
+                cond = self.generate(step.condition)
+                matched = 0
+                reader = t.reader
+                for idx, row in enumerate(t.rows):
+                    reader.row = row
+                    if context.eval(cond):
+                        keep_indices[tname].add(idx)
+                        matched += 1
+                        if matched >= 8:
+                            break
+            res = orig_pf(self, context, step, iterator)
+            if tname is not None and not step.condition and len(res.rows) == len(t.rows):
+                res._orig_tname = tname
+            return res
 
         PythonExecutor._project_and_filter = _trace_pf
         try:
@@ -177,6 +180,34 @@ def main() -> int:
                 PythonExecutor(tables=t_ens_full).execute(Plan(opt_expr))
         finally:
             PythonExecutor._project_and_filter = orig_pf
+
+        # Also cover all 5 ss_quantity buckets in store_sales (plus NULLs) for TPC-DS q=8
+        if "store_sales" in raw_full:
+            ss_cols, ss_rows = raw_full["store_sales"]
+            if "ss_quantity" in ss_cols:
+                q_idx = ss_cols.index("ss_quantity")
+                bucket_counts = {b: 0 for b in range(6)}  # 0..4 = 5 buckets, 5 = None
+                for idx, row in enumerate(ss_rows):
+                    q = row[q_idx]
+                    if q is None:
+                        b = 5
+                    elif 1 <= q <= 20:
+                        b = 0
+                    elif 21 <= q <= 40:
+                        b = 1
+                    elif 41 <= q <= 60:
+                        b = 2
+                    elif 61 <= q <= 80:
+                        b = 3
+                    elif 81 <= q <= 100:
+                        b = 4
+                    else:
+                        continue
+                    if bucket_counts[b] < 4:
+                        keep_indices["store_sales"].add(idx)
+                        bucket_counts[b] += 1
+                        if all(c >= 4 for c in bucket_counts.values()):
+                            break
 
         te.TestExecutor.tpcds_tables = {
             name: Table(cols, [rows[idx] for idx in sorted(keep_indices[name])])

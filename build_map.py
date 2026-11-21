@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import pickle
+import pkgutil
 import sys
 import time
 import unittest
@@ -71,6 +72,11 @@ class _LineRecorder:
         self.test_funcs: dict[int, set[tuple[str, int]]] = collections.defaultdict(set)
         self.test_files_opened: dict[int, set[str]] = collections.defaultdict(set)
         self.setup_files_opened: dict[tuple[str, str], set[str]] = collections.defaultdict(set)
+        self.setup_lines: dict[tuple[str, str], dict[str, set[int]]] = collections.defaultdict(
+            lambda: collections.defaultdict(set)
+        )
+        self.setup_funcs: dict[tuple[str, str], set[tuple[str, int]]] = collections.defaultdict(set)
+        self.setup_modules: dict[tuple[str, str], set[str]] = collections.defaultdict(set)
         self.current_class_key: tuple[str, str] | None = None
         self.import_lines: dict[str, set[int]] = collections.defaultdict(set)
         self.test_to_imported_modules: dict[int, set[str]] = collections.defaultdict(set)
@@ -102,6 +108,10 @@ class _LineRecorder:
             self.test_funcs[self.current_test].add((rel, firstline))
             if rel.startswith("sqlglot/"):
                 self.test_to_imported_modules[self.current_test].add(rel)
+        elif self.current_test == -2 and self.current_class_key is not None:
+            self.setup_funcs[self.current_class_key].add((rel, firstline))
+            if rel.startswith("sqlglot/"):
+                self.setup_modules[self.current_class_key].add(rel)
         return sys.monitoring.DISABLE
 
     def on_line(self, code, line_number):
@@ -112,6 +122,8 @@ class _LineRecorder:
             return sys.monitoring.DISABLE
         if self.current_test >= 0:
             self.test_lines[self.current_test][rel].add(line_number)
+        elif self.current_test == -2 and self.current_class_key is not None:
+            self.setup_lines[self.current_class_key][rel].add(line_number)
         else:
             self.import_lines[rel].add(line_number)
         return sys.monitoring.DISABLE
@@ -133,6 +145,8 @@ class _LineRecorder:
                 p = p.resolve()
             if str(p).lower().startswith(self.repo_prefix):
                 rel = p.relative_to(self.repo_root).as_posix()
+                if "__pycache__" in rel or rel.endswith((".pyc", ".pyo", ".so", ".pyd")):
+                    return
                 if rel.startswith(("tests/fixtures/", "sqlglot/", "sqlglotc/")):
                     if self.current_test >= 0:
                         self.test_files_opened[self.current_test].add(rel)
@@ -324,9 +338,18 @@ def main() -> int:
         parts = t["id"].split("::")
         grouped.setdefault((parts[0], parts[1]), []).append(t)
 
-    # Pre-import sqlglot to separate base import lines if desired
+    # Pre-import all sqlglot modules before activating tracing so lazy module imports
+    # during the first test do not pollute line_to_tests or file_open_to_tests
     import sqlglot
     from sqlglot import Dialect
+
+    for info in pkgutil.walk_packages(sqlglot.__path__, prefix="sqlglot."):
+        if info.name == "sqlglot.__main__":
+            continue
+        try:
+            importlib.import_module(info.name)
+        except Exception:
+            continue
 
     failures = []
     # Also ensure Dialect.classes stays consistent across TestDialectEntryPoints
@@ -337,12 +360,26 @@ def main() -> int:
             mod.ProcessPoolExecutor = InlinePoolExecutor
         cls = getattr(mod, cls_name)
 
-        recorder.current_class_key = (rel_file, cls_name)
+        class_key = (rel_file, cls_name)
+        recorder.current_class_key = class_key
         recorder.current_test = -1
         saved_dialects = dict(Dialect._classes) if cls_name == "TestDialectEntryPoints" else None
 
         if hasattr(cls, "setUpClass"):
-            cls.setUpClass()
+            recorder.current_test = -2
+            recorder.active = True
+            sys.monitoring.set_events(TOOL_ID, events_mask)
+            sys.monitoring.restart_events()
+            try:
+                cls.setUpClass()
+            finally:
+                recorder.active = False
+                sys.monitoring.set_events(TOOL_ID, 0)
+                recorder.current_test = -1
+
+        s_lines = recorder.setup_lines.get(class_key)
+        s_funcs = recorder.setup_funcs.get(class_key)
+        s_mods = recorder.setup_modules.get(class_key)
 
         for item in items:
             test_num = item["number"]
@@ -361,6 +398,14 @@ def main() -> int:
             recorder.active = False
             sys.monitoring.set_events(TOOL_ID, 0)
             recorder.current_test = -1
+
+            if s_lines:
+                for rf, lns in s_lines.items():
+                    recorder.test_lines[test_num][rf].update(lns)
+            if s_funcs:
+                recorder.test_funcs[test_num].update(s_funcs)
+            if s_mods:
+                recorder.test_to_imported_modules[test_num].update(s_mods)
 
             if not result.wasSuccessful():
                 failures.append((test_num, item["id"], result.errors + result.failures))
