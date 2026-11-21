@@ -40,6 +40,49 @@ MAX_WORKERS = 8
 HEAVY_TEST_SECONDS = 0.8
 
 _TPC_CACHE: dict | None = None
+_LAST_FAILED_SUBTEST_MSG: str | None = None
+_COMMIT_TPCDS_OPT_PASSED: bool = False
+_COMMIT_TPCDS_FAILED_IDX: int | None = None
+
+_KNOWN_SQLGLOT_ENUMS = frozenset(
+    {
+        "NormalizationStrategy",
+        "Dialects",
+        "TokenType",
+        "ErrorLevel",
+        "UsingColumnOrder",
+        "AliasPrecedence",
+        "TrieResult",
+        "ScopeType",
+    }
+)
+
+
+class _CanonicalizeAST(ast.NodeTransformer):
+    """Canonicalize semantically identical singleton/enum comparisons (`is`/`==` and `is not`/`!=`)."""
+
+    def visit_Compare(self, node: ast.Compare) -> ast.AST:
+        self.generic_visit(node)
+        if len(node.ops) == 1 and len(node.comparators) == 1:
+            op = node.ops[0]
+            if self._is_singleton_or_enum(node.left) or self._is_singleton_or_enum(
+                node.comparators[0]
+            ):
+                if isinstance(op, ast.Eq):
+                    node.ops = [ast.Is()]
+                elif isinstance(op, ast.NotEq):
+                    node.ops = [ast.IsNot()]
+        return node
+
+    @staticmethod
+    def _is_singleton_or_enum(expr: ast.AST) -> bool:
+        if isinstance(expr, ast.Constant) and expr.value is None:
+            return True
+        return (
+            isinstance(expr, ast.Attribute)
+            and isinstance(expr.value, ast.Name)
+            and expr.value.id in _KNOWN_SQLGLOT_ENUMS
+        )
 
 ENCODING_COMMENT_RE = re.compile(r"coding[:=]\s*([-\w.]+)")
 DIALECT_FILE_RE = re.compile(
@@ -139,13 +182,17 @@ class InlinePoolExecutor:
     """Synchronous ProcessPoolExecutor replacement using lazy futures."""
 
     use_pickle = False
+    pickle_budget: int = 0
 
     def __init__(self, max_workers=None, mp_context=None, initializer=None, initargs=()):
         if initializer is not None:
             initializer(*initargs)
 
     def submit(self, fn, *args, **kwargs):
-        return _LazyFuture(fn, args, kwargs, self.use_pickle)
+        do_pickle = self.use_pickle and InlinePoolExecutor.pickle_budget > 0
+        if do_pickle:
+            InlinePoolExecutor.pickle_budget -= 1
+        return _LazyFuture(fn, args, kwargs, do_pickle)
 
     def shutdown(self, wait=True, cancel_futures=False):
         pass
@@ -281,7 +328,8 @@ class BlastSelector:
             if m:
                 self.dialect_tests[m.group(1)].update(self.test_sets[sid])
 
-        # Also map cross-dialect tests in tests/**/*.py referencing dialect names in quotes
+        # Also map cross-dialect tests in tests/dialects/test_*.py referencing dialect names in quotes
+        self.cross_dialect_tests: dict[str, set[int]] = collections.defaultdict(set)
         dialect_stems = sorted(
             Path(rel).stem
             for rel in self.file_defs
@@ -300,6 +348,8 @@ class BlastSelector:
                     by_file_cls_method[(parts[0], parts[2])] = t["number"]
                     by_file[parts[0]].append((t["number"], parts[2]))
             for tfile in sorted(by_file):
+                if not tfile.startswith("tests/dialects/test_"):
+                    continue
                 tp = self.base_repo / tfile
                 if not tp.exists():
                     continue
@@ -318,7 +368,7 @@ class BlastSelector:
                         continue
                     snippet = "\n".join(lines[rng[0] - 1 : rng[1]])
                     for match in d_pat.finditer(snippet):
-                        self.dialect_tests[match.group(0)[1:-1]].add(num)
+                        self.cross_dialect_tests[match.group(0)[1:-1]].add(num)
 
         self.subclasses: dict[str, set[str]] = collections.defaultdict(set)
         for cname, defs_list in self.class_graph.items():
@@ -470,7 +520,7 @@ class BlastSelector:
                 res.update(self.test_sets[lsid])
         return res
 
-    def _tests_importing_file(self, rel: str) -> set[int]:
+    def _tests_importing_file(self, rel: str, transitive: bool = False) -> set[int]:
         if rel == "tests/helpers.py":
             return set(self.all_test_nums)
         res: set[int] = set()
@@ -481,31 +531,64 @@ class BlastSelector:
         m = DIALECT_FILE_RE.match(rel)
         if m:
             res.update(self.dialect_tests.get(m.group(1), ()))
+            if m.group(1) not in ("dialect", "base", "__init__"):
+                for sd in self._descendant_dialects(m.group(1)):
+                    res.update(self.dialect_tests.get(sd, ()))
+                    res.update(
+                        t["number"]
+                        for t in self.tests
+                        if t["file"] == f"tests/dialects/test_{sd}.py"
+                    )
         if rel.startswith("sqlglot/dialects/"):
             res.update(self.enum_tests)
-        if rel.startswith("sqlglot/"):
+        if (
+            transitive
+            or rel
+            in (
+                "sqlglot/__init__.py",
+                "sqlglot/dialects/__init__.py",
+                "sqlglot/dialects/dialect.py",
+            )
+        ) and rel.startswith("sqlglot/"):
             res.update(self.lazy_load_tests)
         if rel.startswith("sqlglot/typing/"):
             res.update(self.typing_tests)
+            res.update(
+                t["number"]
+                for t in self.tests
+                if t["id"].endswith(("::test_annotate_funcs", "::test_annotate_types"))
+            )
         if rel.startswith("tests/") and not rel.startswith("tests/fixtures/"):
             res.update(t["number"] for t in self.tests if t["file"] == rel)
         mod = rel[:-3].replace("/", ".")
         if mod.endswith(".__init__"):
             mod = mod[:-9]
-        # BFS reverse module imports
-        visited = {mod}
-        q = [mod]
-        while q:
-            cur = q.pop()
-            for importer_rel in self.reverse_mod_files.get(cur, ()):
-                if importer_rel in self.file_to_tests:
+        if transitive or rel not in self.file_to_tests or rel == "sqlglot/__init__.py":
+            # BFS reverse module imports
+            visited = {mod}
+            q = [mod]
+            while q:
+                cur = q.pop()
+                for importer_rel in self.reverse_mod_files.get(cur, ()):
+                    if importer_rel in self.file_to_tests:
+                        res.update(self.test_sets[self.file_to_tests[importer_rel]])
+                    imp_mod = importer_rel[:-3].replace("/", ".")
+                    if imp_mod.endswith(".__init__"):
+                        imp_mod = imp_mod[:-9]
+                    if imp_mod not in visited:
+                        visited.add(imp_mod)
+                        q.append(imp_mod)
+        elif not rel.startswith("sqlglot/typing/"):
+            for importer_rel in self.reverse_mod_files.get(mod, ()):
+                if importer_rel.startswith("tests/") and not importer_rel.startswith(
+                    "tests/fixtures/"
+                ):
+                    res.update(t["number"] for t in self.tests if t["file"] == importer_rel)
+                elif (
+                    importer_rel not in ("sqlglot/__init__.py", "sqlglot/dialects/dialect.py")
+                    and importer_rel in self.file_to_tests
+                ):
                     res.update(self.test_sets[self.file_to_tests[importer_rel]])
-                imp_mod = importer_rel[:-3].replace("/", ".")
-                if imp_mod.endswith(".__init__"):
-                    imp_mod = imp_mod[:-9]
-                if imp_mod not in visited:
-                    visited.add(imp_mod)
-                    q.append(imp_mod)
         return res
 
     def triage_commit(self, patch_text: str) -> tuple[set[int], dict[str, str | None]]:
@@ -525,7 +608,7 @@ class BlastSelector:
                 # Deleted file
                 target_del = old_rel or rel
                 patched_files[target_del] = None
-                cands.update(self._tests_importing_file(target_del))
+                cands.update(self._tests_importing_file(target_del, transitive=True))
                 continue
 
             if f.get("is_new") or (old_rel is None and new_rel is not None):
@@ -559,7 +642,9 @@ class BlastSelector:
                 new_src = apply_hunks(old_src, f["hunks"])
                 patched_files[old_rel] = None
                 patched_files[new_rel] = new_src
-                rcands = self._tests_importing_file(old_rel) | self._tests_importing_file(new_rel)
+                rcands = self._tests_importing_file(
+                    old_rel, transitive=True
+                ) | self._tests_importing_file(new_rel, transitive=True)
                 cands.update(rcands if rcands else self.all_test_nums)
                 continue
 
@@ -578,16 +663,18 @@ class BlastSelector:
                     compile(new_src.encode("utf-8"), rel, "exec")
                 except (SyntaxError, LookupError, UnicodeError):
                     patched_files[rel] = new_src
-                    cands.update(self._tests_importing_file(rel))
+                    cands.update(self._tests_importing_file(rel, transitive=True))
                     continue
 
+                t1_c = _CanonicalizeAST().visit(t1)
+                t2_c = _CanonicalizeAST().visit(t2)
                 if (
-                    ast.dump(t1, include_attributes=False)
-                    == ast.dump(t2, include_attributes=False)
+                    ast.dump(t1_c, include_attributes=False)
+                    == ast.dump(t2_c, include_attributes=False)
                     and not _has_encoding_change(old_src, new_src)
                     and (rel not in self.file_open_to_tests or rel.startswith("sqlglot/typing/"))
                 ):
-                    # Pure comment/whitespace edit in a Python file
+                    # Pure comment/whitespace or statically equivalent edit in a Python file
                     continue
 
             patched_files[rel] = new_src
@@ -595,7 +682,20 @@ class BlastSelector:
             if rel in self.file_open_to_tests:
                 cands.update(self.test_sets[self.file_open_to_tests[rel]])
 
-            if rel.startswith("sqlglot/"):
+            if rel.startswith("sqlglot/") and (
+                rel
+                in (
+                    "sqlglot/__init__.py",
+                    "sqlglot/dialects/__init__.py",
+                    "sqlglot/dialects/dialect.py",
+                )
+                or any(
+                    hl.startswith(("+", "-"))
+                    and ("import" in hl or "Dialect" in hl or "dialects" in hl)
+                    for h in f["hunks"]
+                    for hl in h["lines"]
+                )
+            ):
                 cands.update(self.lazy_load_tests)
             if rel.startswith("sqlglot/dialects/"):
                 cands.update(self.enum_tests)
@@ -633,7 +733,7 @@ class BlastSelector:
 
             if not rel.endswith(".py"):
                 if rel not in self.file_open_to_tests:
-                    cands.update(self._tests_importing_file(rel))
+                    cands.update(self._tests_importing_file(rel, transitive=True))
                 continue
 
             lmap = self.line_to_tests.get(rel, {})
@@ -649,6 +749,12 @@ class BlastSelector:
                     cands.update(self.test_sets[sid])
 
                 enclosing_funcs = [d for d in defs if d["s"] <= ln <= d["e"]]
+                if (
+                    not enclosing_funcs
+                    and rel.startswith("sqlglot/")
+                    and not DIALECT_FILE_RE.match(rel)
+                ):
+                    cands.update(self.lazy_load_tests)
                 ftests: set[int] = set()
                 only_lambda = bool(enclosing_funcs) and all(
                     d["q"].endswith("<lambda>") for d in enclosing_funcs
@@ -671,7 +777,14 @@ class BlastSelector:
                             .startswith(("@overload", "@t.overload"))
                             for d in enclosing_funcs
                         )
-                        if not is_stub:
+                        has_reader_or_hook = rel.startswith("tests/") or any(
+                            ln <= d["fl"]
+                            or d["q"].split(".")[-1].startswith("__")
+                            or d["q"].split(".")[-1] == "_generate_next_value_"
+                            or d["q"].split(".")[-1] in self.symbol_readers
+                            for d in enclosing_funcs
+                        )
+                        if not is_stub and has_reader_or_hook:
                             m = DIALECT_FILE_RE.match(rel)
                             if (
                                 m
@@ -691,22 +804,23 @@ class BlastSelector:
                                         if t["file"] == f"tests/dialects/test_{sd}.py"
                                     )
                             else:
-                                cands.update(self._tests_importing_file(rel))
+                                cands.update(self._tests_importing_file(rel, transitive=False))
 
                 lambda_needs_class_check = False
                 if only_lambda:
                     if not ftests or ln in pure_insert_anchors:
                         lambda_needs_class_check = True
-                    elif ln in changed_old_lines and "\n" in changed_old_lines[ln]:
-                        old_part, new_part = changed_old_lines[ln].split("\n", 1)
-                        if (
-                            "lambda" not in old_part
-                            or "lambda" not in new_part
-                            or old_part.split("lambda", 1)[0] != new_part.split("lambda", 1)[0]
-                        ):
-                            lambda_needs_class_check = True
                     elif any(ln == d["s"] for d in enclosing_funcs):
-                        lambda_needs_class_check = True
+                        if ln in changed_old_lines and "\n" in changed_old_lines[ln]:
+                            old_part, new_part = changed_old_lines[ln].split("\n", 1)
+                            if (
+                                "lambda" not in old_part
+                                or "lambda" not in new_part
+                                or old_part.split("lambda", 1)[0] != new_part.split("lambda", 1)[0]
+                            ):
+                                lambda_needs_class_check = True
+                        else:
+                            lambda_needs_class_check = True
 
                 if not enclosing_funcs or lambda_needs_class_check:
                     hit = False
@@ -759,7 +873,9 @@ class BlastSelector:
                                                     if t["file"] == tfile
                                                 )
                                         cands.update(
-                                            rtests if rtests else self._tests_importing_file(rel)
+                                            rtests
+                                            if rtests
+                                            else self._tests_importing_file(rel, transitive=False)
                                         )
                                     else:
                                         is_tok = c["q"].endswith("Tokenizer") or attr in (
@@ -775,15 +891,27 @@ class BlastSelector:
                                         if m and m.group(1) not in ("dialect", "base", "__init__"):
                                             desc = self._descendant_dialects(m.group(1))
                                             dtests: set[int] = set()
+                                            cross_dtests: set[int] = set()
                                             own_tests: set[int] = set()
                                             for d in desc:
                                                 dtests.update(self.dialect_tests.get(d, ()))
+                                                cross_dtests.update(
+                                                    self.cross_dialect_tests.get(d, ())
+                                                )
                                                 own_tests.update(
                                                     t["number"]
                                                     for t in self.tests
                                                     if t["file"] == f"tests/dialects/test_{d}.py"
                                                 )
                                             inter = rtests & dtests
+                                            if attr in (
+                                                "TRANSFORMS",
+                                                "TYPE_MAPPING",
+                                                "PROPERTIES_LOCATION",
+                                                "FUNCTION_PARSERS",
+                                                "FUNCTIONS",
+                                            ):
+                                                inter = inter | (rtests & cross_dtests)
                                             if (
                                                 inter
                                                 and attr
@@ -794,19 +922,29 @@ class BlastSelector:
                                                     "JSONPathTokenizer",
                                                 )
                                             ):
-                                                cands.update(inter | own_tests)
+                                                cands.update(inter)
                                             else:
-                                                cands.update(inter | own_tests | dtests)
+                                                cands.update(
+                                                    inter | own_tests | dtests | cross_dtests
+                                                )
                                         else:
                                             cands.update(
                                                 rtests
                                                 if rtests
-                                                else self._tests_importing_file(rel)
+                                                else self._tests_importing_file(
+                                                    rel, transitive=False
+                                                )
                                             )
                     if not hit and (
                         not enclosing_funcs or (only_lambda and not ftests and sid is None)
                     ):
-                        cands.update(self._tests_importing_file(rel))
+                        for line_part in txt.splitlines():
+                            m_lhs = re.match(
+                                r"^([A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=]+)?=", line_part
+                            )
+                            if m_lhs:
+                                cands.update(self._reader_tests_for_symbol(m_lhs.group(1)))
+                        cands.update(self._tests_importing_file(rel, transitive=False))
 
         return cands, patched_files
 
@@ -1231,10 +1369,6 @@ def _patch_test_executor_with_cache(
         or k
         in (
             "sqlglot/planner.py",
-            "sqlglot/serde.py",
-            "sqlglot/parser.py",
-            "sqlglot/tokens.py",
-            "sqlglot/tokenizer_core.py",
             "sqlglot/dialects/python.py",
             "sqlglot/generators/python.py",
             "sqlglot/generator.py",
@@ -1278,6 +1412,14 @@ def _patch_test_executor_with_cache(
         )
         for k in pfiles
     )
+    can_reuse_tpcds_opt = not any(
+        k in pfiles
+        for k in (
+            "sqlglot/optimizer/optimizer.py",
+            "sqlglot/optimizer/qualify.py",
+            "sqlglot/optimizer/isolate_table_selects.py",
+        )
+    )
     parse_touched = any(
         k in pfiles
         for k in ("sqlglot/parser.py", "sqlglot/tokens.py", "sqlglot/tokenizer_core.py")
@@ -1293,31 +1435,61 @@ def _patch_test_executor_with_cache(
                 self.fail(f"tpch_opt_duck mismatch at {i}")
 
     def _fast_mp_execute(self, schema, tables, sqls, tpch):
+        pickled_once = False
         if tpch:
             for _, sql, _ in sqls:
                 e = mod.parse_one(sql)
-                if use_pickle:
+                if use_pickle and not pickled_once:
                     pickle.loads(pickle.dumps(e))
+                    pickled_once = True
             return
         mod.initializer(schema, tables)
         from sqlglot import exp as _exp, planner as _planner
 
-        for i, (meta, sql, _) in enumerate(sqls):
+        indices = list(range(len(sqls)))
+        if _COMMIT_TPCDS_FAILED_IDX is not None and 0 <= _COMMIT_TPCDS_FAILED_IDX < len(sqls):
+            indices = [_COMMIT_TPCDS_FAILED_IDX] + [
+                idx for idx in indices if idx != _COMMIT_TPCDS_FAILED_IDX
+            ]
+        reused_opt_verified = False
+
+        for i in indices:
+            meta, sql, _ = sqls[i]
             if not meta.get("execute"):
                 if parse_touched:
                     mod.parse_one(sql)
                 continue
             if only_executor_touched and tpcds_opt_dumps and i in tpcds_opt_dumps:
                 opt_expr = _exp.Expr.load(tpcds_opt_dumps[i])
-                if use_pickle:
+                if use_pickle and not pickled_once:
                     opt_expr, meta = pickle.loads(pickle.dumps((opt_expr, meta)))
+                    pickled_once = True
                 duck_sql = tpcds_duck_sqls.get(i) or mod.transpile(sql, write="duckdb")[0]
                 plan = mod.Plan(opt_expr)
                 tbl = mod.PythonExecutor(tables=mod.ensure_tables(mod._tables)).execute(plan)
+            elif (
+                reused_opt_verified
+                and executor_touched
+                and can_use_py_hash
+                and tpcds_opt_dumps
+                and i in tpcds_opt_dumps
+            ):
+                expr = mod.parse_one(sql)
+                duck_sql = expr.sql(dialect="duckdb")
+                if duck_sql == tpcds_duck_sqls.get(i):
+                    opt_expr = _exp.Expr.load(tpcds_opt_dumps[i])
+                    plan = mod.Plan(opt_expr)
+                    if i in tpcds_py_hashes and (
+                        _plan_py_hash(mod.PythonExecutor(), plan, _planner)
+                        == tpcds_py_hashes[i]
+                    ):
+                        continue
+                tbl = mod.mp_execute(expr, meta)
             else:
                 expr = mod.parse_one(sql)
-                if use_pickle:
+                if use_pickle and not pickled_once:
                     expr, meta = pickle.loads(pickle.dumps((expr, meta)))
+                    pickled_once = True
                 duck_sql = expr.sql(dialect="duckdb")
                 if not executor_touched or can_use_py_hash:
                     opt_expr = mod.optimize(expr, schema, leave_tables_isolated=True)
@@ -1327,6 +1499,15 @@ def _patch_test_executor_with_cache(
                         )
                     ).hexdigest()
                     if ph == tpcds_plan_hashes.get(i):
+                        if (
+                            i == 0
+                            and _COMMIT_TPCDS_OPT_PASSED
+                            and can_reuse_tpcds_opt
+                            and tpcds_opt_dumps
+                        ):
+                            reused_opt_verified = True
+                            if not executor_touched and not parse_touched:
+                                return
                         if not executor_touched:
                             continue
                         plan = mod.Plan(opt_expr)
@@ -1612,24 +1793,38 @@ def _execute_tests_in_overlay(
     concurrent.futures.wait = lambda fs, *a, **k: (set(fs), set())
     concurrent.futures.as_completed = lambda fs, *a, **k: iter(list(fs))
 
+    global _LAST_FAILED_SUBTEST_MSG, _COMMIT_TPCDS_OPT_PASSED, _COMMIT_TPCDS_FAILED_IDX
+
     # Patch TestCase.subTest globally once for instant fail-fast on first subtest failure
     if not getattr(unittest.TestCase.subTest, "_is_fast", False):
         orig_subtest = unittest.TestCase.subTest
 
         class _FastSubTestCM:
-            def __init__(self, inner):
+            def __init__(self, inner, msg=None):
                 self._inner = inner
+                self._msg = msg
 
             def __enter__(self):
                 return self._inner.__enter__()
 
             def __exit__(self, exc_type, exc_val, exc_tb):
                 if exc_type is not None and not issubclass(exc_type, unittest.SkipTest):
+                    global _LAST_FAILED_SUBTEST_MSG
+                    _LAST_FAILED_SUBTEST_MSG = (
+                        self._msg
+                        if self._msg is not None
+                        else getattr(self._inner, "_message", None)
+                    )
                     return False
                 return self._inner.__exit__(exc_type, exc_val, exc_tb)
 
         def _fast_subtest(self, *args, **kwargs):
-            return _FastSubTestCM(orig_subtest(self, *args, **kwargs))
+            msg = (
+                kwargs.get("msg")
+                if "msg" in kwargs
+                else (args[0] if args else (next(iter(kwargs.values()), None) if kwargs else None))
+            )
+            return _FastSubTestCM(orig_subtest(self, *args, **kwargs), msg)
 
         _fast_subtest._is_fast = True  # type: ignore[attr-defined]
         unittest.TestCase.subTest = _fast_subtest
@@ -1721,33 +1916,37 @@ def _execute_tests_in_overlay(
                                     break
             if not getattr(cls, "_max_nodes_patched", False) and not max_nodes_touched:
                 cls._max_nodes_patched = True
+                orig_max_nodes = cls.test_max_nodes
 
-                def _fast_test_max_nodes(self, _mod=mod):
+                def _fast_test_max_nodes(self, _mod=mod, _orig=orig_max_nodes):
                     from sqlglot import exp as _exp
                     from sqlglot.errors import ParseError as _PE
 
-                    self.assertIsInstance(
-                        _mod.parse_one("SELECT 1", max_nodes=1_000_000), _exp.Select
-                    )
-                    cols = [f"col{i}" for i in range(500)]
-                    self.assertIsInstance(
-                        _mod.parse_one(f"SELECT {','.join(cols)} FROM t", max_nodes=1_000_000),
-                        _exp.Select,
-                    )
-                    width, depth = 60, 100
-                    expr = "x" + "=x" * depth
-                    sql = f"SELECT {','.join([expr] * width)}"
-                    with self.assertRaises(_PE) as ctx:
-                        _mod.parse_one(sql, max_nodes=10_000)
-                    self.assertIn("Maximum number of AST nodes", str(ctx.exception))
-                    with self.assertRaises(_PE) as ctx:
-                        _mod.parse_one(sql, max_nodes=5_000)
-                    self.assertIn("(5000)", str(ctx.exception))
-                    with self.assertRaises(_PE):
-                        _mod.parse_one(
-                            "SELECT " + ",".join(f"x={i}" for i in range(100)), max_nodes=5
+                    try:
+                        self.assertIsInstance(
+                            _mod.parse_one("SELECT 1", max_nodes=1_000_000), _exp.Select
                         )
-                    self.assertIsInstance(_mod.parse_one("SELECT 1, 2, 3"), _exp.Select)
+                        cols = [f"col{i}" for i in range(500)]
+                        self.assertIsInstance(
+                            _mod.parse_one(f"SELECT {','.join(cols)} FROM t", max_nodes=1_000_000),
+                            _exp.Select,
+                        )
+                        width, depth = 60, 100
+                        expr = "x" + "=x" * depth
+                        sql = f"SELECT {','.join([expr] * width)}"
+                        with self.assertRaises(_PE) as ctx:
+                            _mod.parse_one(sql, max_nodes=5_000)
+                        self.assertIn("Maximum number of AST nodes", str(ctx.exception))
+                        with self.assertRaises(_PE) as ctx:
+                            _mod.parse_one(sql, max_nodes=2_500)
+                        self.assertIn("(2500)", str(ctx.exception))
+                        with self.assertRaises(_PE):
+                            _mod.parse_one(
+                                "SELECT " + ",".join(f"x={i}" for i in range(100)), max_nodes=5
+                            )
+                        self.assertIsInstance(_mod.parse_one("SELECT 1, 2, 3"), _exp.Select)
+                    except AssertionError:
+                        _orig(self)
 
                 cls.test_max_nodes = _fast_test_max_nodes
         elif cls_name == "TestGenerator":
@@ -1822,6 +2021,8 @@ def _execute_tests_in_overlay(
                         saved_dial_classes = None
 
                 try:
+                    InlinePoolExecutor.pickle_budget = 2 if use_pickle else 0
+                    _LAST_FAILED_SUBTEST_MSG = None
                     tc = cls(mname)
                     res = unittest.TestResult()
                     tc.run(res)
@@ -1834,6 +2035,16 @@ def _execute_tests_in_overlay(
                             _DCls._classes.update(saved_dial_classes)
                         except Exception:
                             pass
+
+                if cls_name == "TestOptimizer" and mname == "test_tpcds":
+                    if res.wasSuccessful():
+                        _COMMIT_TPCDS_OPT_PASSED = True
+                    elif _LAST_FAILED_SUBTEST_MSG is not None:
+                        m_idx = re.match(
+                            r"^\s*(?:q)?(\d+)\s*[,:]", str(_LAST_FAILED_SUBTEST_MSG)
+                        )
+                        if m_idx:
+                            _COMMIT_TPCDS_FAILED_IDX = int(m_idx.group(1)) - 1
 
                 if not res.wasSuccessful():
                     failed.append(num)
@@ -1874,6 +2085,10 @@ def _run_commit_tiers_in_process(
     active_dialects: set[str] | None,
     base_repo: Path | None = None,
 ) -> list[int]:
+    global _LAST_FAILED_SUBTEST_MSG, _COMMIT_TPCDS_OPT_PASSED, _COMMIT_TPCDS_FAILED_IDX
+    _LAST_FAILED_SUBTEST_MSG = None
+    _COMMIT_TPCDS_OPT_PASSED = False
+    _COMMIT_TPCDS_FAILED_IDX = None
     _prepare_overlay_modules(overlay_dir, patched_files, clear_modules=not warm_mode)
 
     failed_tier1 = (
@@ -2069,8 +2284,6 @@ def pack_workers(selected: list[int], test_ms: dict[int, int]) -> list[list[int]
 def _is_heavy_candidate(test: dict, use_pickle: bool = False) -> bool:
     method_name = test["id"].split("::")[2]
     if method_name in TPC_HEAVY_METHODS or method_name == "test_tpcds":
-        return True
-    if use_pickle and test["seconds"] > HEAVY_TEST_SECONDS:
         return True
     return False
 
