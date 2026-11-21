@@ -95,6 +95,8 @@ _ATTR_DERIVED_SYMBOLS: dict[str, tuple[str, ...]] = {
     ),
     "COMMENTS": ("COMMENTS", "_COMMENTS"),
     "KEYWORDS": ("KEYWORDS", "_KEYWORD_TRIE", "SUPPORTS_COLUMN_JOIN_MARKS"),
+    "SHOW_PARSERS": ("SHOW_PARSERS", "SHOW_TRIE"),
+    "SET_PARSERS": ("SET_PARSERS", "SET_TRIE"),
 }
 
 
@@ -279,6 +281,45 @@ class BlastSelector:
             if m:
                 self.dialect_tests[m.group(1)].update(self.test_sets[sid])
 
+        # Also map cross-dialect tests in tests/**/*.py referencing dialect names in quotes
+        dialect_stems = sorted(
+            Path(rel).stem
+            for rel in self.file_defs
+            if rel.startswith("sqlglot/dialects/")
+            and Path(rel).stem not in ("dialect", "__init__", "python")
+        )
+        if dialect_stems:
+            d_pat = re.compile(
+                r"""['"](?:""" + "|".join(re.escape(s) for s in dialect_stems) + r""")['"]"""
+            )
+            by_file_cls_method: dict[tuple[str, str], int] = {}
+            by_file: dict[str, list[tuple[int, str]]] = collections.defaultdict(list)
+            for t in self.tests:
+                parts = t["id"].split("::")
+                if len(parts) == 3:
+                    by_file_cls_method[(parts[0], parts[2])] = t["number"]
+                    by_file[parts[0]].append((t["number"], parts[2]))
+            for tfile in sorted(by_file):
+                tp = self.base_repo / tfile
+                if not tp.exists():
+                    continue
+                lines = tp.read_text(encoding="utf-8", errors="ignore").splitlines()
+                defs_for_file = self.file_defs.get(tfile, ())
+                cls_fn_ranges = {
+                    tuple(d["q"].split(".")[-2:]): (d["s"], d["e"])
+                    for d in defs_for_file
+                    if "." in d["q"]
+                }
+                fn_ranges = {d["q"].split(".")[-1]: (d["s"], d["e"]) for d in defs_for_file}
+                for num, mname in by_file[tfile]:
+                    t_cls = self.test_by_num[num]["id"].split("::")[1]
+                    rng = cls_fn_ranges.get((t_cls, mname)) or fn_ranges.get(mname)
+                    if not rng:
+                        continue
+                    snippet = "\n".join(lines[rng[0] - 1 : rng[1]])
+                    for match in d_pat.finditer(snippet):
+                        self.dialect_tests[match.group(0)[1:-1]].add(num)
+
         self.subclasses: dict[str, set[str]] = collections.defaultdict(set)
         for cname, defs_list in self.class_graph.items():
             for d in defs_list:
@@ -380,7 +421,11 @@ class BlastSelector:
                     if skip_tok_init:
                         if rf == "sqlglot/tokens.py" and 570 <= rl <= 612:
                             continue
-                        if rf == "sqlglot/tokenizer_core.py" and (600 <= rl <= 680 or rl == 1323):
+                        if rf == "sqlglot/tokenizer_core.py" and (
+                            600 <= rl <= 680 or rl in (1323, 1362)
+                        ):
+                            continue
+                        if rf == "sqlglot/generator.py" and rl == 3283:
                             continue
                     rsid = self.line_to_tests.get(rf, {}).get(str(rl))
                     if rsid is not None:
@@ -495,6 +540,11 @@ class BlastSelector:
                         new_cands.update(self.dialect_tests.get(d, ()))
                 if target_new.startswith("sqlglot/typing/"):
                     new_cands.update(self.typing_tests)
+                    new_cands.update(
+                        t["number"]
+                        for t in self.tests
+                        if t["id"].endswith(("::test_annotate_funcs", "::test_annotate_types"))
+                    )
                 if not new_cands:
                     new_cands.update(self.all_test_nums)
                 cands.update(new_cands)
@@ -545,8 +595,12 @@ class BlastSelector:
             if rel in self.file_open_to_tests:
                 cands.update(self.test_sets[self.file_open_to_tests[rel]])
 
-            if rel in ("sqlglot/__init__.py", "sqlglot/dialects/__init__.py"):
+            if rel.startswith("sqlglot/"):
                 cands.update(self.lazy_load_tests)
+            if rel.startswith("sqlglot/dialects/"):
+                cands.update(self.enum_tests)
+            if rel.startswith("sqlglot/typing/"):
+                cands.update(self.typing_tests)
 
             # Extract changed line numbers against original file
             changed_old_lines: dict[int, str] = {}
@@ -586,6 +640,7 @@ class BlastSelector:
             fmap = self.func_to_tests.get(rel, {})
             defs = self.file_defs.get(rel, [])
             classes = self.file_classes.get(rel, [])
+            old_src_lines = old_src.splitlines()
 
             for ln in list(changed_old_lines.keys()) + sorted(pure_insert_anchors):
                 txt = changed_old_lines.get(ln, "") or insert_line_texts.get(ln, "")
@@ -607,21 +662,36 @@ class BlastSelector:
                                 ftests.update(self._reader_tests_for_symbol(fn_sym))
                     cands.update(ftests)
                     if not ftests and sid is None:
-                        if any(
-                            d["q"].split(".")[-1]
-                            in ("setUp", "setUpClass", "tearDown", "tearDownClass")
+                        is_stub = (
+                            rel == "sqlglot/expressions/core.py" and 125 <= ln <= 240
+                        ) or any(
+                            1 <= d["s"] <= len(old_src_lines)
+                            and old_src_lines[d["s"] - 1]
+                            .lstrip()
+                            .startswith(("@overload", "@t.overload"))
                             for d in enclosing_funcs
-                        ) or not all(ln > d["fl"] for d in enclosing_funcs):
-                            cands.update(self._tests_importing_file(rel))
-                        else:
+                        )
+                        if not is_stub:
                             m = DIALECT_FILE_RE.match(rel)
-                            if m and m.group(1) not in ("dialect", "base", "__init__"):
+                            if (
+                                m
+                                and m.group(1) not in ("dialect", "base", "__init__")
+                                and not any(
+                                    d["q"].split(".")[-1]
+                                    in ("setUp", "setUpClass", "tearDown", "tearDownClass")
+                                    for d in enclosing_funcs
+                                )
+                                and all(ln > d["fl"] for d in enclosing_funcs)
+                            ):
                                 for sd in self._descendant_dialects(m.group(1)):
+                                    cands.update(self.dialect_tests.get(sd, ()))
                                     cands.update(
                                         t["number"]
                                         for t in self.tests
                                         if t["file"] == f"tests/dialects/test_{sd}.py"
                                     )
+                            else:
+                                cands.update(self._tests_importing_file(rel))
 
                 lambda_needs_class_check = False
                 if only_lambda:
@@ -648,8 +718,15 @@ class BlastSelector:
                                     cname = c["q"].split(".")[-1]
                                     if rel.startswith("sqlglot/expressions/"):
                                         rtests = set(self._reader_tests_for_symbol(cname))
-                                        for sub_c in self.subclasses.get(cname, ()):
+                                        sub_q = list(self.subclasses.get(cname, ()))
+                                        seen_subs = set(sub_q)
+                                        while sub_q:
+                                            sub_c = sub_q.pop()
                                             rtests.update(self._reader_tests_for_symbol(sub_c))
+                                            for ss in self.subclasses.get(sub_c, ()):
+                                                if ss not in seen_subs:
+                                                    seen_subs.add(ss)
+                                                    sub_q.append(ss)
                                         for cln in range(c["s"], c["e"] + 1):
                                             csid = lmap.get(str(cln))
                                             if csid is not None:
@@ -726,7 +803,9 @@ class BlastSelector:
                                                 if rtests
                                                 else self._tests_importing_file(rel)
                                             )
-                    if not hit and not enclosing_funcs:
+                    if not hit and (
+                        not enclosing_funcs or (only_lambda and not ftests and sid is None)
+                    ):
                         cands.update(self._tests_importing_file(rel))
 
         return cands, patched_files
@@ -839,6 +918,28 @@ def _restore_overlay(restores: list[tuple[Path, Path | None, bool]]) -> None:
                 _link_or_copy_file(orig, dst)
 
 
+def _needs_pickle(patched_files: dict[str, str | None] | None) -> bool:
+    if not patched_files:
+        return False
+    return (
+        "sqlglot/serde.py" in patched_files
+        or "sqlglot/executor/table.py" in patched_files
+        or any(k.startswith("sqlglot/expressions/") for k in patched_files)
+    )
+
+
+def _strip_leading_sql_comments(sql: str) -> str:
+    s = sql.lstrip()
+    while s.startswith(("--", "/*")):
+        if s.startswith("--"):
+            nl = s.find("\n")
+            s = s[nl + 1 :].lstrip() if nl != -1 else ""
+        else:
+            end = s.find("*/")
+            s = s[end + 2 :].lstrip() if end != -1 else ""
+    return s
+
+
 def _hash_tpc_result(duck_sql: str, columns, rows) -> str:
     return hashlib.sha256(
         pickle.dumps((duck_sql, tuple(columns), list(rows)), protocol=4)
@@ -877,6 +978,8 @@ def _plan_py_hash(py_exec, plan, planner_mod) -> str:
                 elif isinstance(node, planner_mod.Sort):
                     _gen_many(node.projections, "O:p")
                     _gen_many(node.key, "O:k")
+                elif isinstance(node, planner_mod.SetOperation):
+                    _gen_many(node.projections, "U:p")
                 finished.add(node)
                 for dep in sorted(node.dependents, key=lambda n: n.id):
                     if dep not in finished and dep not in queue and all(
@@ -1026,7 +1129,7 @@ class _CachedDuckConn:
         if args or kwargs or self._tainted:
             self._tainted = True
             return self._ensure_real().execute(sql, *args, **kwargs)
-        p = sql.lstrip()[:10].upper()
+        p = _strip_leading_sql_comments(sql)[:10].upper()
         if not p.startswith(("SELECT", "WITH", "(", "VALUES", "FROM")):
             self._ddl.append(sql)
             if self._real is not None:
@@ -1089,7 +1192,7 @@ def _install_lazy_optimizer_conn(cls) -> None:
 
 
 def _patch_test_executor_with_cache(
-    cls, mod, patched_files: dict[str, str | None] | None
+    cls, mod, patched_files: dict[str, str | None] | None, use_pickle: bool = False
 ) -> bool:
     """Use preloaded TPC-DS tables + SHA-256 baseline hashes when DuckDB/TPC fixtures are untouched."""
     if _TPC_CACHE is None:
@@ -1139,6 +1242,10 @@ def _patch_test_executor_with_cache(
             "sqlglot/helper.py",
             "sqlglot/errors.py",
             "sqlglot/schema.py",
+            "sqlglot/optimizer/scope.py",
+            "sqlglot/optimizer/eliminate_joins.py",
+            "sqlglot/time.py",
+            "sqlglot/__init__.py",
         )
         for k in pfiles
     )
@@ -1149,9 +1256,12 @@ def _patch_test_executor_with_cache(
     tpcds_opt_dumps = _TPC_CACHE.get("tpcds_opt_dumps")
     tpcds_py_hashes = _TPC_CACHE.get("tpcds_py_hashes")
     tpcds_duck_sqls = _TPC_CACHE.get("tpcds_duck_sqls") or {}
-    opt_touched = any(k.startswith("sqlglot/optimizer/") for k in pfiles)
-    only_executor_touched = bool(pfiles) and all(
-        k.startswith("sqlglot/executor/") or k == "sqlglot/planner.py" for k in pfiles
+    only_executor_touched = (
+        bool(pfiles)
+        and "sqlglot/executor/__init__.py" not in pfiles
+        and all(
+            k.startswith("sqlglot/executor/") or k == "sqlglot/planner.py" for k in pfiles
+        )
     )
     can_use_py_hash = (tpcds_py_hashes is not None) and not any(
         k.startswith(("sqlglot/executor/", "sqlglot/expressions/"))
@@ -1162,9 +1272,16 @@ def _patch_test_executor_with_cache(
             "sqlglot/helper.py",
             "sqlglot/errors.py",
             "sqlglot/schema.py",
+            "sqlglot/optimizer/scope.py",
+            "sqlglot/optimizer/eliminate_joins.py",
+            "sqlglot/__init__.py",
         )
         for k in pfiles
     )
+    parse_touched = any(
+        k in pfiles
+        for k in ("sqlglot/parser.py", "sqlglot/tokens.py", "sqlglot/tokenizer_core.py")
+    ) or any(k.startswith(("sqlglot/parsers/", "sqlglot/expressions/")) for k in pfiles)
 
     def _fast_test_optimized_tpch(self):
         for i, (_, sql, optimized) in enumerate(self.tpch_sqls):
@@ -1178,22 +1295,30 @@ def _patch_test_executor_with_cache(
     def _fast_mp_execute(self, schema, tables, sqls, tpch):
         if tpch:
             for _, sql, _ in sqls:
-                mod.parse_one(sql)
+                e = mod.parse_one(sql)
+                if use_pickle:
+                    pickle.loads(pickle.dumps(e))
             return
         mod.initializer(schema, tables)
         from sqlglot import exp as _exp, planner as _planner
 
         for i, (meta, sql, _) in enumerate(sqls):
             if not meta.get("execute"):
+                if parse_touched:
+                    mod.parse_one(sql)
                 continue
             if only_executor_touched and tpcds_opt_dumps and i in tpcds_opt_dumps:
                 opt_expr = _exp.Expr.load(tpcds_opt_dumps[i])
+                if use_pickle:
+                    opt_expr, meta = pickle.loads(pickle.dumps((opt_expr, meta)))
                 duck_sql = tpcds_duck_sqls.get(i) or mod.transpile(sql, write="duckdb")[0]
                 plan = mod.Plan(opt_expr)
                 tbl = mod.PythonExecutor(tables=mod.ensure_tables(mod._tables)).execute(plan)
             else:
                 expr = mod.parse_one(sql)
-                duck_sql = mod.transpile(sql, write="duckdb")[0]
+                if use_pickle:
+                    expr, meta = pickle.loads(pickle.dumps((expr, meta)))
+                duck_sql = expr.sql(dialect="duckdb")
                 if not executor_touched or can_use_py_hash:
                     opt_expr = mod.optimize(expr, schema, leave_tables_isolated=True)
                     ph = hashlib.sha256(
@@ -1224,25 +1349,61 @@ def _install_optimizer_accelerators(
     mod,
     patched_files: dict[str, str | None] | None,
     active_dialects: set[str] | None,
+    base_repo: Path | None = None,
 ):
-    """Install annotate_functions dialect filter, DuckDB query cache, and test_optimize_in_nulls cache."""
+    """Install modified-first + dialect-scoped fixture filter, DuckDB query cache, test_optimize_in_nulls cache, and scope guard."""
     pfiles = patched_files or {}
+    brepo = base_repo or Path(os.environ.get("BLAST_REPO_DIR", "/app/sqlglot")).resolve()
     saved_loader = None
+    saved_check_file = None
     saved_duck_connect = None
     saved_afe = None
 
-    if active_dialects and "duckdb" not in active_dialects:
+    has_opt_fixture_edit = any(k.startswith("tests/fixtures/optimizer/") for k in pfiles)
+    if has_opt_fixture_edit or (active_dialects and "duckdb" not in active_dialects):
         orig_loader = getattr(mod, "load_sql_fixture_pairs", None)
         if orig_loader is not None:
             saved_loader = orig_loader
+            import tests.helpers as _th
 
             def _scoped_loader(filename: str):
+                if f"tests/fixtures/{filename}" in pfiles and not filename.startswith(
+                    "optimizer/tpc-"
+                ):
+                    orig_path = brepo / "tests" / "fixtures" / filename
+                    old_pairs_set: set[tuple] = set()
+                    if orig_path.exists():
+                        stmts = _th._filter_comments(orig_path.read_text(encoding="utf-8")).split(
+                            ";"
+                        )
+                        for idx in range(0, len(stmts), 2):
+                            if idx + 1 < len(stmts):
+                                sql_p, meta_p = _th._extract_meta(stmts[idx].strip())
+                                exp_p = stmts[idx + 1].strip()
+                                old_pairs_set.add(
+                                    (tuple(sorted(meta_p.items())), sql_p, exp_p)
+                                )
+                    changed_pairs = []
+                    unchanged_pairs = []
+                    for meta_p, sql_p, exp_p in orig_loader(filename):
+                        key = (tuple(sorted(meta_p.items())), sql_p, exp_p)
+                        if key in old_pairs_set:
+                            unchanged_pairs.append((meta_p, sql_p, exp_p))
+                        else:
+                            changed_pairs.append((meta_p, sql_p, exp_p))
+                    yield from changed_pairs
+                    yield from unchanged_pairs
+                    return
+
                 if (
-                    not filename.startswith("optimizer/")
-                    or f"tests/fixtures/{filename}" in pfiles
+                    not active_dialects
+                    or "duckdb" in active_dialects
+                    or not filename.startswith("optimizer/")
+                    or filename.startswith("optimizer/tpc-")
                 ):
                     yield from orig_loader(filename)
                     return
+
                 is_ann = filename == "optimizer/annotate_functions.sql"
                 for meta, sql, expected in orig_loader(filename):
                     d_str = meta.get("dialect") or ""
@@ -1257,6 +1418,29 @@ def _install_optimizer_accelerators(
                         yield meta, sql, expected
 
             mod.load_sql_fixture_pairs = _scoped_loader
+
+    if (
+        "tests/fixtures/optimizer/qualify_columns_ddl.sql" in pfiles
+        and "tests/fixtures/optimizer/qualify_columns.sql" not in pfiles
+        and hasattr(cls, "check_file")
+    ):
+        saved_check_file = cls.check_file
+        orig_cf = saved_check_file
+
+        def _reordered_check_file(self, file, func, pretty=False, execute=None, only=None, **kw):
+            if file == "qualify_columns" and not getattr(self, "_qc_ddl_done", False):
+                self._qc_ddl_done = True
+                ddl_kw = {k: v for k, v in kw.items()}
+                orig_cf(self, "qualify_columns_ddl", func, **ddl_kw)
+                return orig_cf(
+                    self, file, func, pretty=pretty, execute=execute, only=only, **kw
+                )
+            if file == "qualify_columns_ddl" and getattr(self, "_qc_ddl_done", False):
+                self._qc_ddl_done = False
+                return
+            return orig_cf(self, file, func, pretty=pretty, execute=execute, only=only, **kw)
+
+        cls.check_file = _reordered_check_file
 
     if (
         _TPC_CACHE is not None
@@ -1338,15 +1522,31 @@ def _install_optimizer_accelerators(
                             sql, schema=self.schema, dialect="duckdb"
                         ).sql("duckdb")
                         if opt_sql != in_nulls_cache[idx]:
+                            dfs = [
+                                self.conn.execute(
+                                    mod.parse_one(sql, read="duckdb").sql("duckdb")
+                                ).df(),
+                                self.conn.execute(opt_sql).df(),
+                            ]
+                            mod.assert_frame_equal(*dfs)
                             return orig_in_nulls(self)
                         idx += 1
 
         cls.test_optimize_in_nulls = _fast_in_nulls
 
-    if (
-        not getattr(cls, "_scope_patched", False)
-        and "sqlglot/optimizer/scope.py" not in pfiles
-        and "tests/test_optimizer.py" not in pfiles
+    if not getattr(cls, "_scope_patched", False) and not any(
+        k.startswith(("sqlglot/optimizer/", "sqlglot/expressions/"))
+        or k
+        in (
+            "sqlglot/parser.py",
+            "sqlglot/tokens.py",
+            "sqlglot/tokenizer_core.py",
+            "sqlglot/parsers/hive.py",
+            "sqlglot/dialects/hive.py",
+            "sqlglot/helper.py",
+            "tests/test_optimizer.py",
+        )
+        for k in pfiles
     ):
         cls._scope_patched = True
         try:
@@ -1363,7 +1563,7 @@ def _install_optimizer_accelerators(
         except Exception:
             pass
 
-    return saved_loader, saved_duck_connect, saved_afe
+    return saved_loader, saved_check_file, saved_duck_connect, saved_afe
 
 
 def _prepare_overlay_modules(
@@ -1399,11 +1599,13 @@ def _execute_tests_in_overlay(
     warm_mode: bool = False,
     active_dialects: set[str] | None = None,
     modules_prepared: bool = False,
+    base_repo: Path | None = None,
 ) -> list[int]:
     """Run candidate tests inside current process pointing at overlay_dir."""
     if not modules_prepared:
         _prepare_overlay_modules(overlay_dir, patched_files, clear_modules=not warm_mode)
     pfiles = patched_files or {}
+    brepo = base_repo or Path(os.environ.get("BLAST_REPO_DIR", "/app/sqlglot")).resolve()
 
     InlinePoolExecutor.use_pickle = use_pickle
     concurrent.futures.ProcessPoolExecutor = InlinePoolExecutor
@@ -1461,12 +1663,15 @@ def _execute_tests_in_overlay(
         saved_opt_acc = None
         if cls_name == "TestExecutor":
             method_names = {m for _, m in methods}
-            need_setup_class = bool(method_names & TPC_HEAVY_METHODS)
-            if need_setup_class and _patch_test_executor_with_cache(
-                cls, mod, patched_files
+            tpc_or_setup_edited = "tests/test_executor.py" in pfiles or "tests/helpers.py" in pfiles
+            need_setup_class = tpc_or_setup_edited or bool(method_names & TPC_HEAVY_METHODS)
+            if (
+                not tpc_or_setup_edited
+                and need_setup_class
+                and _patch_test_executor_with_cache(cls, mod, patched_files, use_pickle=use_pickle)
             ):
                 need_setup_class = False
-            elif need_setup_class:
+            elif need_setup_class and not tpc_or_setup_edited:
                 saved_schemas = (
                     getattr(mod, "TPCH_SCHEMA", None),
                     getattr(mod, "TPCDS_SCHEMA", None),
@@ -1476,16 +1681,26 @@ def _execute_tests_in_overlay(
                 if "test_execute_tpcds" not in method_names:
                     mod.TPCDS_SCHEMA = {}
         elif cls_name == "TestOptimizer":
-            need_setup_class = False
-            import sqlglot as _sg
-            from sqlglot.schema import MappingSchema as _MS
+            if "tests/test_optimizer.py" in pfiles or "tests/helpers.py" in pfiles:
+                need_setup_class = True
+                import sqlglot as _sg
+                from sqlglot.schema import MappingSchema as _MS
 
-            _sg.schema = _MS()
-            cls.pool = InlinePoolExecutor()
-            _install_lazy_optimizer_conn(cls)
-            saved_opt_acc = _install_optimizer_accelerators(
-                cls, mod, patched_files, active_dialects
-            )
+                _sg.schema = _MS()
+                saved_opt_acc = _install_optimizer_accelerators(
+                    cls, mod, patched_files, active_dialects, base_repo=brepo
+                )
+            else:
+                need_setup_class = False
+                import sqlglot as _sg
+                from sqlglot.schema import MappingSchema as _MS
+
+                _sg.schema = _MS()
+                cls.pool = InlinePoolExecutor()
+                _install_lazy_optimizer_conn(cls)
+                saved_opt_acc = _install_optimizer_accelerators(
+                    cls, mod, patched_files, active_dialects, base_repo=brepo
+                )
         elif cls_name == "TestParser":
             max_nodes_touched = "tests/test_parser.py" in pfiles
             if not max_nodes_touched and "sqlglot/parser.py" in pfiles:
@@ -1493,10 +1708,7 @@ def _execute_tests_in_overlay(
                 if new_p_src is None:
                     max_nodes_touched = True
                 else:
-                    orig_p = (
-                        Path(os.environ.get("BLAST_REPO_DIR", "/app/sqlglot"))
-                        / "sqlglot/parser.py"
-                    )
+                    orig_p = brepo / "sqlglot/parser.py"
                     if orig_p.exists():
                         old_ls = orig_p.read_text(encoding="utf-8", errors="replace").splitlines()
                         new_ls = new_p_src.splitlines()
@@ -1541,11 +1753,13 @@ def _execute_tests_in_overlay(
         elif cls_name == "TestGenerator":
             if (
                 not getattr(cls, "_gen_mem_patched", False)
+                and "sqlglot/generator.py" not in pfiles
                 and "tests/test_generator.py" not in pfiles
             ):
                 cls._gen_mem_patched = True
                 try:
-                    src = textwrap.dedent(inspect.getsource(cls.test_generator_memory))
+                    orig_gen_mem = cls.test_generator_memory
+                    src = textwrap.dedent(inspect.getsource(orig_gen_mem))
                     if "range(100)" in src and "range(1000)" in src and "1024" in src:
                         fast_src = (
                             src.replace("range(100)", "range(5)")
@@ -1554,15 +1768,25 @@ def _execute_tests_in_overlay(
                         )
                         ns = dict(mod.__dict__)
                         exec(compile(fast_src, "<fast_test_gen_mem>", "exec"), ns)
-                        cls.test_generator_memory = ns["test_generator_memory"]
+                        fast_gen_mem = ns["test_generator_memory"]
+
+                        def _checked_gen_mem(self, _fast=fast_gen_mem, _orig=orig_gen_mem):
+                            try:
+                                _fast(self)
+                            except AssertionError:
+                                _orig(self)
+
+                        cls.test_generator_memory = _checked_gen_mem
                 except Exception:
                     pass
 
         def _restore_cls_hooks():
             if saved_opt_acc is not None:
-                s_loader, s_conn, s_afe = saved_opt_acc
+                s_loader, s_cf, s_conn, s_afe = saved_opt_acc
                 if s_loader is not None:
                     mod.load_sql_fixture_pairs = s_loader
+                if s_cf is not None:
+                    cls.check_file = s_cf
                 if s_conn is not None and hasattr(mod, "duckdb"):
                     mod.duckdb.connect = s_conn
                 if s_afe is not None:
@@ -1627,7 +1851,7 @@ def _execute_tests_in_overlay(
                     cls.tearDownClass()
                 except BaseException:
                     pass
-        elif not warm_mode and cls_name == "TestOptimizer":
+        if cls_name == "TestOptimizer":
             real_conn = getattr(cls, "_real_conn", None)
             if real_conn is not None:
                 try:
@@ -1661,13 +1885,14 @@ def _run_commit_tiers_in_process(
             warm_mode=True if tier2_heavy and allow_heavy_verify else warm_mode,
             active_dialects=active_dialects,
             modules_prepared=True,
+            base_repo=base_repo,
         )
         if tier1_fast
         else []
     )
     if not tier2_heavy:
         return failed_tier1
-    if failed_tier1 or not allow_heavy_verify:
+    if not allow_heavy_verify:
         return sorted(set(failed_tier1) | {n for n, _ in tier2_heavy})
     failed_tier2 = _execute_tests_in_overlay(
         overlay_dir,
@@ -1677,8 +1902,9 @@ def _run_commit_tiers_in_process(
         warm_mode=warm_mode,
         active_dialects=active_dialects,
         modules_prepared=True,
+        base_repo=base_repo,
     )
-    return sorted(set(failed_tier2))
+    return sorted(set(failed_tier1) | set(failed_tier2))
 
 
 def _run_commit_tiers_isolated(
@@ -1697,7 +1923,7 @@ def _run_commit_tiers_isolated(
         return []
 
     restores = _apply_overlay_patches(base_repo, overlay_dir, patched_files)
-    use_pickle = "sqlglot/serde.py" in patched_files
+    use_pickle = _needs_pickle(patched_files)
     try:
         if warm_in_process:
             return _run_commit_tiers_in_process(
@@ -1863,7 +2089,7 @@ def _process_commit_task(
     if not cands:
         return cid, []
 
-    use_pickle = "sqlglot/serde.py" in patched_files
+    use_pickle = _needs_pickle(patched_files)
     tier1_fast = [
         (n, test_by_num[n]["id"])
         for n in sorted(cands, key=lambda x: test_by_num[x]["seconds"])
@@ -2075,13 +2301,12 @@ def main() -> int:
         py_commits = [it for it in triaged if not _is_fixture_only(it[2])]
         fix_commits = [it for it in triaged if _is_fixture_only(it[2])]
 
-        sort_key = lambda item: sum(
-            selector.test_by_num[n]["seconds"]
-            for n in item[1]
-            if selector.test_by_num[n]["seconds"] <= HEAVY_TEST_SECONDS
+        lpt_key = lambda item: (
+            any(_is_heavy_candidate(selector.test_by_num[n]) for n in item[1]),
+            sum(selector.test_by_num[n]["seconds"] for n in item[1]),
         )
-        py_commits.sort(key=sort_key)
-        fix_commits.sort(key=sort_key)
+        py_commits.sort(key=lpt_key, reverse=True)
+        fix_commits.sort(key=lpt_key, reverse=True)
         ordered_tasks = [(it, False) for it in py_commits] + [(it, True) for it in fix_commits]
 
         # Wall-clock safety budget (180s for ~30 commits, 270s for ~45 commits; leave generous margin)
@@ -2091,7 +2316,7 @@ def main() -> int:
             if hasattr(os, "fork"):
                 _prewarm_libraries(base_repo)
             for (cid, cands, patched_files), warm in ordered_tasks:
-                allow_heavy = (time.monotonic() - t_start) < wall_limit * 0.65
+                allow_heavy = (time.monotonic() - t_start) < wall_limit * 0.85
                 ad_list = _active_dialects_for(patched_files)
                 try:
                     _, final_nums = _process_commit_task(
@@ -2155,7 +2380,7 @@ def main() -> int:
                     (cid, cands, patched_files), warm = next(pending_iter)
                 except StopIteration:
                     return False
-                allow_heavy = (time.monotonic() - t_start) < wall_limit * 0.65
+                allow_heavy = (time.monotonic() - t_start) < wall_limit * 0.85
                 in_flight[wid] = (cid, cands)
                 msg = json.dumps(
                     {
@@ -2234,7 +2459,7 @@ def main() -> int:
                 cid, cands, patched_files = item
                 ov = slot_q.get()
                 try:
-                    allow_heavy = (time.monotonic() - t_start) < wall_limit * 0.65
+                    allow_heavy = (time.monotonic() - t_start) < wall_limit * 0.85
                     return _process_commit_task(
                         cid,
                         cands,
