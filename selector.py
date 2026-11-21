@@ -24,6 +24,7 @@ import os
 from pathlib import Path
 import pickle
 import re
+import selectors
 import shutil
 import subprocess
 import sys
@@ -271,6 +272,11 @@ class BlastSelector:
             res.update(self.test_sets[self.file_to_tests[rel]])
         if rel in self.file_open_to_tests:
             res.update(self.test_sets[self.file_open_to_tests[rel]])
+        m = DIALECT_FILE_RE.match(rel)
+        if m:
+            res.update(self.dialect_tests.get(m.group(1), ()))
+        if rel.startswith("sqlglot/typing/"):
+            res.update(self.typing_tests)
         if rel.startswith("tests/") and not rel.startswith("tests/fixtures/"):
             res.update(t["number"] for t in self.tests if t["file"] == rel)
         mod = rel[:-3].replace("/", ".")
@@ -831,21 +837,67 @@ def _process_commit_task(
 
 
 def _prewarm_libraries() -> None:
-    """Pre-import heavy third-party packages once in parent before os.fork()."""
+    """Pre-import heavy libraries once before os.fork() with single-threaded BLAS."""
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
     for modname in (
-        "duckdb",
         "numpy",
         "pandas",
         "pandas.testing",
+        "duckdb",
+        "unittest.mock",
+        "sqlite3",
+        "yaml",
         "pytz",
         "dateutil",
-        "yaml",
-        "sqlite3",
+        "decimal",
+        "csv",
+        "tracemalloc",
     ):
         try:
             importlib.import_module(modname)
         except Exception:
             pass
+
+
+def _linux_worker_loop(
+    read_fd: int,
+    write_fd: int,
+    base_repo: Path,
+    overlay_dir: Path,
+    test_by_num: dict[int, dict],
+) -> None:
+    """Single-threaded persistent worker process receiving tasks over pipe and forking per test run."""
+    with os.fdopen(read_fd, "r", encoding="utf-8") as rx, os.fdopen(
+        write_fd, "w", encoding="utf-8"
+    ) as tx:
+        for line in rx:
+            line = line.strip()
+            if not line:
+                continue
+            task = json.loads(line)
+            cid, final_nums = _process_commit_task(
+                task["cid"],
+                task["cands"],
+                task["patched_files"],
+                base_repo,
+                overlay_dir,
+                test_by_num,
+                task["allow_heavy"],
+            )
+            tx.write(json.dumps({"cid": cid, "final": final_nums}) + "\n")
+            tx.flush()
+
+
+def _read_cgroup_cpu_seconds() -> float | None:
+    try:
+        for line in Path("/sys/fs/cgroup/cpu.stat").read_text().splitlines():
+            if line.startswith("usage_usec "):
+                return int(line.split()[1]) / 1_000_000.0
+    except OSError:
+        pass
+    return None
 
 
 def main() -> int:
@@ -889,9 +941,9 @@ def main() -> int:
         print(json.dumps({"commit": cid, "workers": []}), flush=True)
 
     if triaged:
-        # Pre-import heavy libs once on Linux before os.fork()
-        if hasattr(os, "fork"):
-            _prewarm_libraries()
+        os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+        os.environ.setdefault("OMP_NUM_THREADS", "1")
+        os.environ.setdefault("MKL_NUM_THREADS", "1")
 
         # Build up to 2 overlay directories (matching 2 container CPUs)
         n_workers = min(2, len(triaged))
@@ -912,6 +964,8 @@ def main() -> int:
         wall_limit = max(90.0, 3.2 * len(patch_paths))
 
         if n_workers == 1:
+            if hasattr(os, "fork"):
+                _prewarm_libraries()
             for cid, cands, patched_files in triaged:
                 allow_heavy = (time.monotonic() - t_start) < wall_limit * 0.65
                 _, final_nums = _process_commit_task(
@@ -925,9 +979,93 @@ def main() -> int:
                 )
                 workers = pack_workers(final_nums, selector.test_ms)
                 print(json.dumps({"commit": cid, "workers": workers}), flush=True)
+        elif hasattr(os, "fork"):
+            # Pre-warm once in parent (Threads: 1 with OPENBLAS_NUM_THREADS=1) before forking
+            _prewarm_libraries()
+            sel_io = selectors.DefaultSelector()
+            worker_pids: list[int] = []
+            worker_tx: dict[int, object] = {}
+            worker_rx: dict[int, object] = {}
+
+            for i in range(n_workers):
+                p2c_r, p2c_w = os.pipe()
+                c2p_r, c2p_w = os.pipe()
+                pid = os.fork()
+                if pid == 0:
+                    os.close(p2c_w)
+                    os.close(c2p_r)
+                    for tx in worker_tx.values():
+                        tx.close()
+                    for rx in worker_rx.values():
+                        rx.close()
+                    try:
+                        _linux_worker_loop(
+                            p2c_r, c2p_w, base_repo, overlays[i], selector.test_by_num
+                        )
+                    finally:
+                        os._exit(0)
+                else:
+                    os.close(p2c_r)
+                    os.close(c2p_w)
+                    worker_pids.append(pid)
+                    tx_f = os.fdopen(p2c_w, "w", encoding="utf-8")
+                    rx_f = os.fdopen(c2p_r, "r", encoding="utf-8")
+                    worker_tx[i] = tx_f
+                    worker_rx[i] = rx_f
+                    sel_io.register(rx_f, selectors.EVENT_READ, data=i)
+
+            pending_iter = iter(triaged)
+            active = 0
+
+            def _send_next(wid: int) -> bool:
+                nonlocal active
+                try:
+                    cid, cands, patched_files = next(pending_iter)
+                except StopIteration:
+                    return False
+                allow_heavy = (time.monotonic() - t_start) < wall_limit * 0.65
+                msg = json.dumps(
+                    {
+                        "cid": cid,
+                        "cands": cands,
+                        "patched_files": patched_files,
+                        "allow_heavy": allow_heavy,
+                    }
+                )
+                worker_tx[wid].write(msg + "\n")
+                worker_tx[wid].flush()
+                active += 1
+                return True
+
+            for wid in range(n_workers):
+                _send_next(wid)
+
+            while active > 0:
+                for key, _ in sel_io.select():
+                    wid = key.data
+                    resp_line = worker_rx[wid].readline()
+                    if not resp_line:
+                        sel_io.unregister(worker_rx[wid])
+                        active -= 1
+                        continue
+                    active -= 1
+                    res = json.loads(resp_line)
+                    workers = pack_workers(res["final"], selector.test_ms)
+                    print(
+                        json.dumps({"commit": res["cid"], "workers": workers}),
+                        flush=True,
+                    )
+                    _send_next(wid)
+
+            sel_io.close()
+            for tx_f in worker_tx.values():
+                tx_f.close()
+            for rx_f in worker_rx.values():
+                rx_f.close()
+            for pid in worker_pids:
+                os.waitpid(pid, 0)
         else:
-            # 2-slot concurrent execution using threads dispatching isolated child processes
-            # (On Linux each slot runs in its own overlay and os.fork()s; on Windows subprocess runs in its own overlay)
+            # Windows fallback using 2 threads + isolated subprocesses
             from concurrent.futures import ThreadPoolExecutor
             import queue
 
@@ -959,8 +1097,10 @@ def main() -> int:
 
         shutil.rmtree(work_root, ignore_errors=True)
 
+    cgroup_cpu = _read_cgroup_cpu_seconds()
+    cpu_note = f", container_cpu={cgroup_cpu:.3f}s" if cgroup_cpu is not None else ""
     print(
-        f"processed {len(patch_paths)} commits in {time.monotonic() - t_start:.2f}s wall",
+        f"processed {len(patch_paths)} commits in {time.monotonic() - t_start:.2f}s wall{cpu_note}",
         file=sys.stderr,
     )
     return 0

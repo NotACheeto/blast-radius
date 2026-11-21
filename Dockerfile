@@ -11,5 +11,5 @@ RUN pip install --no-cache-dir -r /app/requirements.lock && \
 COPY blast_map.json.gz selector.py /app/
 RUN chmod a+r /app/blast_map.json.gz /app/selector.py
 
-ENV PYTHONPATH=/app/sqlglot SKIP_INTEGRATION=0 PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONPATH=/app/sqlglot SKIP_INTEGRATION=0 PYTHONDONTWRITEBYTECODE=1 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
 CMD ["python", "/app/selector.py"]
