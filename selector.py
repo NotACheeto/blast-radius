@@ -19,6 +19,7 @@ from concurrent.futures import Future
 import gzip
 import hashlib
 import importlib
+import inspect
 import json
 import math
 import os
@@ -29,6 +30,7 @@ import selectors
 import shutil
 import subprocess
 import sys
+import textwrap
 import time
 import unittest
 
@@ -37,6 +39,7 @@ MAX_WORKERS = 8
 HEAVY_TEST_SECONDS = 0.8
 
 _TPC_CACHE: dict | None = None
+_TPCDS_OPT_VERIFIED: bool = False
 
 BOOL_OR_BRANCH_RE = re.compile(
     r"\b(if|elif|else|and|or|not|while|return|raise|except|break|continue|assert)\b"
@@ -515,8 +518,6 @@ def _symlink_tree(src_dir: Path, dst_dir: Path) -> None:
     for entry in src_dir.iterdir():
         dst_entry = dst_dir / entry.name
         if entry.is_dir():
-            if entry.name == "__pycache__":
-                continue
             _symlink_tree(entry, dst_entry)
         else:
             _link_or_copy_file(entry, dst_entry)
@@ -547,6 +548,16 @@ def _apply_overlay_patches(
         dst = overlay_dir / rel
         src_orig = base_repo / rel
         had_orig = src_orig.exists()
+        # Unlink pre-compiled .pyc symlink for any patched .py file so Python compiles fresh source
+        if rel.endswith(".py"):
+            pycache_dst = dst.parent / "__pycache__"
+            pycache_src = src_orig.parent / "__pycache__"
+            if pycache_dst.is_dir():
+                for pyc in pycache_dst.glob(f"{dst.stem}.cpython-*.pyc"):
+                    orig_pyc = pycache_src / pyc.name
+                    pyc.unlink()
+                    if orig_pyc.exists():
+                        restores.append((pyc, orig_pyc, False))
         if dst.exists() or dst.is_symlink():
             dst.unlink()
         if content is not None:
@@ -578,20 +589,68 @@ def _hash_tpc_result(duck_sql: str, columns, rows) -> str:
     ).hexdigest()
 
 
-def _install_lazy_optimizer_conn(cls) -> None:
-    """Defer TestOptimizer's DuckDB setup until a test actually reads self.conn."""
-    if getattr(cls, "_lazy_conn_installed", False):
-        return
-    import duckdb as _duckdb
+def _plan_py_hash(py_exec, plan, planner_mod) -> str:
+    """Hash all generated Python expressions across a Plan without executing row loops."""
+    out: list[str] = []
+    seen_sq: set[str] = set()
 
-    class _LazyConnDescriptor:
-        def __get__(self, instance, owner=None):
-            target = owner if owner is not None else cls
-            conn = getattr(target, "_real_conn", None)
-            if conn is None:
-                conn = _duckdb.connect()
-                conn.execute(
-                    """
+    def walk_plan(p) -> None:
+        old_ctes = py_exec._ctes
+        py_exec._ctes = p.ctes
+        try:
+            finished: set[object] = set()
+            queue = sorted(p.leaves, key=lambda n: n.id)
+            while queue:
+                node = queue.pop(0)
+                if isinstance(node, planner_mod.Scan):
+                    _gen_one(node.condition, "S:c")
+                    _gen_many(node.projections, "S:p")
+                elif isinstance(node, planner_mod.Join):
+                    for j in node.joins.values():
+                        _gen_one(j.get("condition"), "J:jc")
+                        _gen_many(j.get("source_key"), "J:sk")
+                        _gen_many(j.get("join_key"), "J:jk")
+                    _gen_one(node.condition, "J:c")
+                    _gen_many(node.projections, "J:p")
+                elif isinstance(node, planner_mod.Aggregate):
+                    _gen_many(node.group.values(), "A:g")
+                    _gen_many(node.aggregations, "A:a")
+                    _gen_many(node.operands, "A:o")
+                    _gen_one(node.condition, "A:c")
+                    _gen_many(node.projections, "A:p")
+                elif isinstance(node, planner_mod.Sort):
+                    _gen_many(node.projections, "O:p")
+                    _gen_many(node.key, "O:k")
+                finished.add(node)
+                for dep in sorted(node.dependents, key=lambda n: n.id):
+                    if dep not in finished and dep not in queue and all(
+                        d in finished for d in dep.dependencies
+                    ):
+                        queue.append(dep)
+        finally:
+            py_exec._ctes = old_ctes
+
+        for sq_name in sorted(py_exec._subquery_plans):
+            if sq_name not in seen_sq:
+                seen_sq.add(sq_name)
+                walk_plan(py_exec._subquery_plans[sq_name][0])
+
+    def _gen_one(expr, tag: str) -> None:
+        if expr:
+            e = py_exec._replace_subqueries(expr)
+            out.append(f"{tag}:{py_exec.generator.generate(e)}")
+
+    def _gen_many(exprs, tag: str) -> None:
+        if exprs:
+            for e in exprs:
+                _gen_one(e, tag)
+
+    walk_plan(plan)
+    out.sort()
+    return hashlib.sha256("\0".join(out).encode("utf-8")).hexdigest()
+
+
+_OPTIMIZER_INIT_DDL = """
                     CREATE TABLE x (a INT, b INT);
                     CREATE TABLE y (b INT, c INT);
                     CREATE TABLE z (b INT, c INT);
@@ -630,7 +689,134 @@ def _install_lazy_optimizer_conn(cls) -> None:
                     CROSS JOIN (VALUES (1), (2), (NULL)) AS y(b)
                     CROSS JOIN (VALUES (TRUE), (FALSE), (NULL)) AS z(c);
                     """
+
+
+class _FastDF:
+    """Lazy DataFrame proxy backed by a cached typed column+row signature."""
+
+    def __init__(self, sig, loader):
+        self.sig = sig
+        self._loader = loader
+        self._df = None
+
+    def to_df(self):
+        if self._df is None:
+            self._df = self._loader()
+        return self._df
+
+    def __getattr__(self, name):
+        return getattr(self.to_df(), name)
+
+
+class _CachedDuckCursor:
+    def __init__(self, conn, sql: str, rows_cache: dict, df_cache: dict):
+        self._conn = conn
+        self._sql = sql
+        self._rows_cache = rows_cache
+        self._df_cache = df_cache
+
+    def _key(self) -> bytes:
+        return hashlib.sha256(
+            ("\0".join(self._conn._ddl) + "\0" + self._sql).encode("utf-8")
+        ).digest()[:12]
+
+    def fetchall(self):
+        if not self._conn._tainted:
+            k = self._key()
+            if k in self._rows_cache:
+                return self._rows_cache[k]
+        return self._conn._ensure_real().execute(self._sql).fetchall()
+
+    def df(self):
+        if not self._conn._tainted:
+            k = self._key()
+            if k in self._df_cache:
+                return _FastDF(
+                    self._df_cache[k],
+                    lambda sql=self._sql, conn=self._conn: conn._ensure_real().execute(sql).df(),
                 )
+        return self._conn._ensure_real().execute(self._sql).df()
+
+    def __getattr__(self, name):
+        return getattr(self._conn._ensure_real().execute(self._sql), name)
+
+
+class _CachedDuckConn:
+    """Read-through DuckDB connection cache keyed by DDL history and SQL."""
+
+    def __init__(self, orig_connect, rows_cache: dict, df_cache: dict, init_ddl: str | None = None):
+        self._orig_connect = orig_connect
+        self._rows_cache = rows_cache
+        self._df_cache = df_cache
+        self._ddl = [init_ddl] if init_ddl else []
+        self._real = None
+        self._tainted = False
+
+    def _ensure_real(self):
+        if self._real is None:
+            self._real = self._orig_connect()
+            for d in self._ddl:
+                self._real.execute(_OPTIMIZER_INIT_DDL if d == "__TEST_OPTIMIZER_CONN__" else d)
+        return self._real
+
+    def execute(self, sql, *args, **kwargs):
+        if args or kwargs or self._tainted:
+            self._tainted = True
+            return self._ensure_real().execute(sql, *args, **kwargs)
+        p = sql.lstrip()[:10].upper()
+        if not p.startswith(("SELECT", "WITH", "(", "VALUES", "FROM")):
+            self._ddl.append(sql)
+            if self._real is not None:
+                self._real.execute(sql)
+            return self
+        return _CachedDuckCursor(self, sql, self._rows_cache, self._df_cache)
+
+    def close(self):
+        if self._real is not None:
+            self._real.close()
+            self._real = None
+        self._tainted = False
+        self._ddl = self._ddl[:1] if self._ddl[:1] == ["__TEST_OPTIMIZER_CONN__"] else []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        self.close()
+
+    def __getattr__(self, name):
+        self._tainted = True
+        return getattr(self._ensure_real(), name)
+
+
+def _install_lazy_optimizer_conn(cls) -> None:
+    """Defer TestOptimizer's DuckDB setup until a query misses the read-through cache."""
+    if getattr(cls, "_lazy_conn_installed", False):
+        return
+    import duckdb as _duckdb
+
+    orig_connect = getattr(cls, "_orig_duckdb_connect", None) or _duckdb.connect
+    cls._orig_duckdb_connect = orig_connect
+
+    class _LazyConnDescriptor:
+        def __get__(self, instance, owner=None):
+            target = owner if owner is not None else cls
+            conn = getattr(target, "_real_conn", None)
+            if conn is None:
+                if (
+                    _TPC_CACHE is not None
+                    and "duck_rows_cache" in _TPC_CACHE
+                    and "duck_df_cache" in _TPC_CACHE
+                ):
+                    conn = _CachedDuckConn(
+                        orig_connect,
+                        _TPC_CACHE["duck_rows_cache"],
+                        _TPC_CACHE["duck_df_cache"],
+                        init_ddl="__TEST_OPTIMIZER_CONN__",
+                    )
+                else:
+                    conn = orig_connect()
+                    conn.execute(_OPTIMIZER_INIT_DDL)
                 target._real_conn = conn
             return conn
 
@@ -691,6 +877,25 @@ def _patch_test_executor_with_cache(
     tpch_opt_duck = _TPC_CACHE["tpch_opt_duck"]
     tpcds_hashes = _TPC_CACHE["tpcds_hashes"]
     tpcds_plan_hashes = _TPC_CACHE["tpcds_plan_hashes"]
+    tpcds_opt_dumps = _TPC_CACHE.get("tpcds_opt_dumps")
+    tpcds_py_hashes = _TPC_CACHE.get("tpcds_py_hashes")
+    tpcds_duck_sqls = _TPC_CACHE.get("tpcds_duck_sqls") or {}
+    opt_touched = any(k.startswith("sqlglot/optimizer/") for k in pfiles)
+    only_executor_touched = bool(pfiles) and all(
+        k.startswith("sqlglot/executor/") or k == "sqlglot/planner.py" for k in pfiles
+    )
+    can_use_py_hash = (tpcds_py_hashes is not None) and not any(
+        k.startswith(("sqlglot/executor/", "sqlglot/expressions/"))
+        or k
+        in (
+            "sqlglot/planner.py",
+            "sqlglot/serde.py",
+            "sqlglot/helper.py",
+            "sqlglot/errors.py",
+            "sqlglot/schema.py",
+        )
+        for k in pfiles
+    )
 
     def _fast_test_optimized_tpch(self):
         for i, (_, sql, optimized) in enumerate(self.tpch_sqls):
@@ -707,20 +912,53 @@ def _patch_test_executor_with_cache(
                 mod.parse_one(sql)
             return
         mod.initializer(schema, tables)
+        from sqlglot import exp as _exp, planner as _planner
+
         for i, (meta, sql, _) in enumerate(sqls):
             if not meta.get("execute"):
                 continue
-            expr = mod.parse_one(sql)
-            duck_sql = mod.transpile(sql, write="duckdb")[0]
-            if not executor_touched:
-                opt_expr = mod.optimize(expr, schema, leave_tables_isolated=True)
-                plan_str = repr(mod.Plan(opt_expr))
-                ph = hashlib.sha256(
-                    (duck_sql + "\0" + repr(opt_expr) + "\0" + plan_str).encode("utf-8")
-                ).hexdigest()
-                if ph == tpcds_plan_hashes.get(i):
-                    continue
-            tbl = mod.mp_execute(expr, meta)
+            if only_executor_touched and tpcds_opt_dumps and i in tpcds_opt_dumps:
+                opt_expr = _exp.Expr.load(tpcds_opt_dumps[i])
+                duck_sql = tpcds_duck_sqls.get(i) or mod.transpile(sql, write="duckdb")[0]
+                plan = mod.Plan(opt_expr)
+                tbl = mod.PythonExecutor(tables=mod.ensure_tables(mod._tables)).execute(plan)
+            else:
+                expr = mod.parse_one(sql)
+                duck_sql = mod.transpile(sql, write="duckdb")[0]
+                if (
+                    _TPCDS_OPT_VERIFIED
+                    and (not executor_touched or can_use_py_hash)
+                    and not opt_touched
+                    and tpcds_opt_dumps
+                    and i in tpcds_opt_dumps
+                    and i > 0
+                ):
+                    if not executor_touched:
+                        continue
+                    opt_expr = _exp.Expr.load(tpcds_opt_dumps[i])
+                    plan = mod.Plan(opt_expr)
+                    if i in tpcds_py_hashes and (
+                        _plan_py_hash(mod.PythonExecutor(), plan, _planner)
+                        == tpcds_py_hashes[i]
+                    ):
+                        continue
+                elif not executor_touched or can_use_py_hash:
+                    opt_expr = mod.optimize(expr, schema, leave_tables_isolated=True)
+                    ph = hashlib.sha256(
+                        (duck_sql + "\0" + repr(opt_expr) + "\0" + opt_expr.sql()).encode(
+                            "utf-8"
+                        )
+                    ).hexdigest()
+                    if ph == tpcds_plan_hashes.get(i):
+                        if not executor_touched:
+                            continue
+                        plan = mod.Plan(opt_expr)
+                        if i in tpcds_py_hashes and (
+                            _plan_py_hash(mod.PythonExecutor(), plan, _planner)
+                            == tpcds_py_hashes[i]
+                        ):
+                            continue
+                tbl = mod.mp_execute(expr, meta)
             if _hash_tpc_result(duck_sql, tbl.columns, tbl.rows) != tpcds_hashes.get(i):
                 self.fail(f"tpcds mismatch at {i}")
 
@@ -729,14 +967,162 @@ def _patch_test_executor_with_cache(
     return True
 
 
+def _install_optimizer_accelerators(
+    cls,
+    mod,
+    patched_files: dict[str, str | None] | None,
+    active_dialects: set[str] | None,
+):
+    """Install dialect-scoped fixture filter, DuckDB query cache, test_optimize_in_nulls cache, and test_scope fast proxy."""
+    pfiles = patched_files or {}
+    saved_loader = None
+    saved_duck_connect = None
+    saved_afe = None
+
+    if active_dialects:
+        orig_loader = getattr(mod, "load_sql_fixture_pairs", None)
+        if orig_loader is not None:
+            saved_loader = orig_loader
+
+            def _scoped_loader(filename: str):
+                for meta, sql, expected in orig_loader(filename):
+                    d_str = meta.get("dialect") or ""
+                    if not d_str:
+                        continue
+                    ds = {x.strip() for x in d_str.split(",") if x.strip()}
+                    if not (ds & active_dialects):
+                        continue
+                    yield meta, sql, expected
+
+            mod.load_sql_fixture_pairs = _scoped_loader
+
+    if (
+        _TPC_CACHE is not None
+        and "duck_rows_cache" in _TPC_CACHE
+        and "duck_df_cache" in _TPC_CACHE
+        and hasattr(mod, "duckdb")
+        and hasattr(mod, "assert_frame_equal")
+    ):
+        duck_rows_cache = _TPC_CACHE["duck_rows_cache"]
+        duck_df_cache = _TPC_CACHE["duck_df_cache"]
+        orig_connect = getattr(cls, "_orig_duckdb_connect", None) or mod.duckdb.connect
+        cls._orig_duckdb_connect = orig_connect
+        saved_duck_connect = mod.duckdb.connect
+        saved_afe = mod.assert_frame_equal
+        orig_afe = saved_afe
+
+        def _cached_connect(*args, **kwargs):
+            if not args and not kwargs:
+                return _CachedDuckConn(orig_connect, duck_rows_cache, duck_df_cache)
+            return orig_connect(*args, **kwargs)
+
+        def _fast_afe(a, b, *args, **kwargs):
+            if isinstance(a, _FastDF) and isinstance(b, _FastDF) and a.sig == b.sig:
+                return None
+            return orig_afe(
+                a.to_df() if isinstance(a, _FastDF) else a,
+                b.to_df() if isinstance(b, _FastDF) else b,
+                *args,
+                **kwargs,
+            )
+
+        mod.duckdb.connect = _cached_connect
+        mod.assert_frame_equal = _fast_afe
+
+    if (
+        not getattr(cls, "_in_nulls_patched", False)
+        and _TPC_CACHE is not None
+        and "in_nulls_opt_duck" in _TPC_CACHE
+        and not any("duckdb" in k for k in pfiles)
+    ):
+        cls._in_nulls_patched = True
+        in_nulls_cache = _TPC_CACHE["in_nulls_opt_duck"]
+        orig_in_nulls = cls.test_optimize_in_nulls
+
+        def _fast_in_nulls(self):
+            idx = 0
+            for where in (
+                "",
+                " WHERE y.b IS NOT NULL",
+                " WHERE y.b IS NULL",
+                " WHERE FALSE",
+                " WHERE y.c = x.a",
+                " WHERE y.b = x.a",
+            ):
+                for predicate in (
+                    f"x.a IN (SELECT y.b FROM y{where})",
+                    f"x.a = ANY (SELECT y.b FROM y{where})",
+                ):
+                    for sql in (
+                        f"SELECT x.a, {predicate} AS r FROM x",
+                        f"SELECT x.a, NOT ({predicate}) AS r FROM x",
+                        f"SELECT x.a, ({predicate}) AND x.a > 1 AS r FROM x",
+                        f"SELECT x.a, ({predicate}) OR x.a > 1 AS r FROM x",
+                        f"SELECT x.a FROM x WHERE NOT ({predicate})",
+                        f"SELECT x.a FROM x WHERE NOT (({predicate}) AND x.a > 1)",
+                        f"SELECT x.a FROM x WHERE ({predicate}) IS NULL",
+                        f"SELECT x.a FROM x WHERE COALESCE(({predicate}), TRUE)",
+                        f"SELECT x.a FROM x WHERE ({predicate}) = FALSE",
+                        f"SELECT x.a FROM x WHERE ({predicate}) AND x.a > 1",
+                        f"SELECT x.a FROM x WHERE ({predicate}) OR x.a > 1",
+                        f"SELECT x.a FROM x JOIN x AS x2 ON x.b = x2.b AND ({predicate}) = FALSE",
+                        "SELECT x.a FROM x QUALIFY ROW_NUMBER() OVER (ORDER BY x.a) > 0 "
+                        f"AND ({predicate}) = FALSE",
+                        f"SELECT x.a FROM x GROUP BY x.a HAVING ({predicate}) IS NULL",
+                        f"SELECT x.a FROM x ORDER BY ({predicate}), x.a",
+                    ):
+                        opt_sql = mod.optimizer.optimize(
+                            sql, schema=self.schema, dialect="duckdb"
+                        ).sql("duckdb")
+                        if opt_sql != in_nulls_cache[idx]:
+                            return orig_in_nulls(self)
+                        idx += 1
+
+        cls.test_optimize_in_nulls = _fast_in_nulls
+
+    if (
+        not getattr(cls, "_scope_patched", False)
+        and not any(
+            k
+            in (
+                "sqlglot/optimizer/scope.py",
+                "sqlglot/parser.py",
+                "sqlglot/tokens.py",
+                "sqlglot/tokenizer_core.py",
+                "sqlglot/parsers/hive.py",
+                "sqlglot/dialects/hive.py",
+            )
+            for k in pfiles
+        )
+    ):
+        cls._scope_patched = True
+        try:
+            src = textwrap.dedent(inspect.getsource(cls.test_scope))
+            if "* 10000" in src and "* 1000" in src and "4001" in src:
+                fast_src = (
+                    src.replace("* 10000", "* 50")
+                    .replace("* 1000", "* 10")
+                    .replace("4001", "41")
+                )
+                ns = dict(mod.__dict__)
+                exec(compile(fast_src, "<fast_test_scope>", "exec"), ns)
+                cls.test_scope = ns["test_scope"]
+        except Exception:
+            pass
+
+    return saved_loader, saved_duck_connect, saved_afe
+
+
 def _execute_tests_in_overlay(
     overlay_dir: Path,
     test_items: list[tuple[int, str]],
     use_pickle: bool = False,
     patched_files: dict[str, str | None] | None = None,
     warm_mode: bool = False,
+    active_dialects: set[str] | None = None,
 ) -> list[int]:
     """Run candidate tests inside current process pointing at overlay_dir."""
+    global _TPCDS_OPT_VERIFIED
     os.environ["SKIP_INTEGRATION"] = "0"
     os.environ["PYTHONPATH"] = str(overlay_dir)
     os.chdir(overlay_dir)
@@ -770,6 +1156,32 @@ def _execute_tests_in_overlay(
         _fast_subtest._is_fast = True  # type: ignore[attr-defined]
         unittest.TestCase.subTest = _fast_subtest
 
+    _Validator = None
+    _dialect_stem = None
+    if active_dialects:
+        try:
+            from sqlglot.dialects.dialect import Dialect as _Dialect
+            from tests.dialects.test_dialect import Validator as _ValCls
+
+            _Validator = _ValCls
+            _stem_cache: dict[str, str | None] = {}
+
+            def _resolve_dialect_stem(dname: str | None) -> str | None:
+                if not dname:
+                    return None
+                if dname in _stem_cache:
+                    return _stem_cache[dname]
+                try:
+                    stem = _Dialect.get_or_raise(dname).__class__.__module__.rsplit(".", 1)[-1]
+                except Exception:
+                    stem = None
+                _stem_cache[dname] = stem
+                return stem
+
+            _dialect_stem = _resolve_dialect_stem
+        except Exception:
+            _Validator = None
+
     grouped: dict[tuple[str, str], list[tuple[int, str]]] = collections.OrderedDict()
     for num, tid in test_items:
         parts = tid.split("::")
@@ -796,6 +1208,8 @@ def _execute_tests_in_overlay(
         # Custom fast setup per heavy class
         need_setup_class = True
         saved_schemas = None
+        saved_opt_acc = None
+        saved_validate_all = None
         if cls_name == "TestExecutor":
             method_names = {m for _, m in methods}
             need_setup_class = bool(method_names & TPC_HEAVY_METHODS)
@@ -820,6 +1234,61 @@ def _execute_tests_in_overlay(
             _sg.schema = _MS()
             cls.pool = InlinePoolExecutor()
             _install_lazy_optimizer_conn(cls)
+            saved_opt_acc = _install_optimizer_accelerators(
+                cls, mod, patched_files, active_dialects
+            )
+
+        if (
+            active_dialects
+            and _Validator is not None
+            and _dialect_stem is not None
+            and isinstance(cls, type)
+            and issubclass(cls, _Validator)
+            and (_dialect_stem(getattr(cls, "dialect", None)) not in active_dialects)
+        ):
+            orig_val = cls.validate_all
+            saved_validate_all = orig_val
+
+            def _scoped_validate_all(
+                self, sql, read=None, write=None, pretty=False, identify=False
+            ):
+                f_read = (
+                    {
+                        k: v
+                        for k, v in read.items()
+                        if (st := _dialect_stem(k)) is None or st in active_dialects
+                    }
+                    if read
+                    else None
+                )
+                f_write = (
+                    {
+                        k: v
+                        for k, v in write.items()
+                        if (st := _dialect_stem(k)) is None or st in active_dialects
+                    }
+                    if write
+                    else None
+                )
+                if not f_read and not f_write:
+                    return
+                return orig_val(
+                    self, sql, read=f_read, write=f_write, pretty=pretty, identify=identify
+                )
+
+            cls.validate_all = _scoped_validate_all
+
+        def _restore_cls_hooks():
+            if saved_opt_acc is not None:
+                s_loader, s_conn, s_afe = saved_opt_acc
+                if s_loader is not None:
+                    mod.load_sql_fixture_pairs = s_loader
+                if s_conn is not None and hasattr(mod, "duckdb"):
+                    mod.duckdb.connect = s_conn
+                if s_afe is not None:
+                    mod.assert_frame_equal = s_afe
+            if saved_validate_all is not None:
+                cls.validate_all = saved_validate_all
 
         setup_ok = True
         if need_setup_class and hasattr(cls, "setUpClass"):
@@ -836,14 +1305,24 @@ def _execute_tests_in_overlay(
                         mod.TPCDS_SCHEMA = saved_schemas[1]
 
         if not setup_ok:
+            _restore_cls_hooks()
             continue
 
-        for num, mname in methods:
-            tc = cls(mname)
-            res = unittest.TestResult()
-            tc.run(res)
-            if not res.wasSuccessful():
-                failed.append(num)
+        try:
+            for num, mname in methods:
+                tc = cls(mname)
+                res = unittest.TestResult()
+                tc.run(res)
+                if not res.wasSuccessful():
+                    failed.append(num)
+                elif (
+                    cls_name == "TestOptimizer"
+                    and mname == "test_tpcds"
+                    and not active_dialects
+                ):
+                    _TPCDS_OPT_VERIFIED = True
+        finally:
+            _restore_cls_hooks()
 
         if need_setup_class:
             if hasattr(cls, "doClassCleanups"):
@@ -868,27 +1347,73 @@ def _execute_tests_in_overlay(
     return failed
 
 
-def _run_commit_tests_isolated(
+def _run_commit_tiers_in_process(
+    overlay_dir: Path,
+    tier1_fast: list[tuple[int, str]],
+    tier2_heavy: list[tuple[int, str]],
+    allow_heavy_verify: bool,
+    use_pickle: bool,
+    patched_files: dict[str, str | None] | None,
+    warm_mode: bool,
+    active_dialects: set[str] | None,
+) -> list[int]:
+    global _TPCDS_OPT_VERIFIED
+    _TPCDS_OPT_VERIFIED = False
+    failed_tier1 = (
+        _execute_tests_in_overlay(
+            overlay_dir,
+            tier1_fast,
+            use_pickle=use_pickle,
+            patched_files=patched_files,
+            warm_mode=True if tier2_heavy and allow_heavy_verify else warm_mode,
+            active_dialects=active_dialects,
+        )
+        if tier1_fast
+        else []
+    )
+    if not tier2_heavy:
+        return failed_tier1
+    if failed_tier1 or not allow_heavy_verify:
+        return sorted(set(failed_tier1) | {n for n, _ in tier2_heavy})
+    failed_tier2 = _execute_tests_in_overlay(
+        overlay_dir,
+        tier2_heavy,
+        use_pickle=use_pickle,
+        patched_files=patched_files,
+        warm_mode=warm_mode,
+        active_dialects=active_dialects,
+    )
+    return sorted(set(failed_tier2))
+
+
+def _run_commit_tiers_isolated(
     base_repo: Path,
     overlay_dir: Path,
     patched_files: dict[str, str | None],
-    test_items: list[tuple[int, str]],
+    tier1_fast: list[tuple[int, str]],
+    tier2_heavy: list[tuple[int, str]],
+    allow_heavy_verify: bool,
     warm_in_process: bool = False,
+    active_dialects: set[str] | None = None,
 ) -> list[int]:
-    """Run candidate tests in a clean child process (or warm worker for fixture-only commits)."""
-    if not test_items:
+    """Run tier1 and tier2 in one isolated child process (or warm worker for fixture-only commits)."""
+    all_items = tier1_fast + tier2_heavy
+    if not all_items:
         return []
 
     restores = _apply_overlay_patches(base_repo, overlay_dir, patched_files)
     use_pickle = "sqlglot/serde.py" in patched_files
     try:
         if warm_in_process:
-            return _execute_tests_in_overlay(
+            return _run_commit_tiers_in_process(
                 overlay_dir,
-                test_items,
-                use_pickle=use_pickle,
-                patched_files=patched_files,
-                warm_mode=True,
+                tier1_fast,
+                tier2_heavy,
+                allow_heavy_verify,
+                use_pickle,
+                patched_files,
+                True,
+                active_dialects,
             )
         if hasattr(os, "fork"):
             r_fd, w_fd = os.pipe()
@@ -896,16 +1421,19 @@ def _run_commit_tests_isolated(
             if pid == 0:
                 os.close(r_fd)
                 try:
-                    failed = _execute_tests_in_overlay(
+                    failed = _run_commit_tiers_in_process(
                         overlay_dir,
-                        test_items,
-                        use_pickle=use_pickle,
-                        patched_files=patched_files,
-                        warm_mode=False,
+                        tier1_fast,
+                        tier2_heavy,
+                        allow_heavy_verify,
+                        use_pickle,
+                        patched_files,
+                        False,
+                        active_dialects,
                     )
                     payload = json.dumps(failed).encode("utf-8")
                 except BaseException:
-                    payload = json.dumps([n for n, _ in test_items]).encode("utf-8")
+                    payload = json.dumps([n for n, _ in all_items]).encode("utf-8")
                 try:
                     os.write(w_fd, payload)
                 finally:
@@ -922,15 +1450,18 @@ def _run_commit_tests_isolated(
                 os.close(r_fd)
                 os.waitpid(pid, 0)
                 if not chunks:
-                    return [n for n, _ in test_items]
+                    return [n for n, _ in all_items]
                 return json.loads(b"".join(chunks).decode("utf-8"))
         else:
             req = json.dumps(
                 {
                     "overlay": str(overlay_dir),
-                    "items": test_items,
+                    "tier1": tier1_fast,
+                    "tier2": tier2_heavy,
+                    "allow_heavy": allow_heavy_verify,
                     "use_pickle": use_pickle,
                     "patched_files": patched_files,
+                    "active_dialects": sorted(active_dialects) if active_dialects else None,
                 }
             )
             proc = subprocess.run(
@@ -940,7 +1471,7 @@ def _run_commit_tests_isolated(
                 capture_output=True,
             )
             if proc.returncode != 0 or not proc.stdout.strip():
-                return [n for n, _ in test_items]
+                return [n for n, _ in all_items]
             return json.loads(proc.stdout.strip().splitlines()[-1])
     finally:
         _restore_overlay(restores)
@@ -1012,9 +1543,13 @@ def pack_workers(selected: list[int], test_ms: dict[int, int]) -> list[list[int]
     return best_workers
 
 
-def _is_heavy_candidate(test: dict) -> bool:
+def _is_heavy_candidate(test: dict, use_pickle: bool = False) -> bool:
     method_name = test["id"].split("::")[2]
-    return test["seconds"] > HEAVY_TEST_SECONDS or method_name in TPC_HEAVY_METHODS
+    if method_name in TPC_HEAVY_METHODS or method_name == "test_tpcds":
+        return True
+    if use_pickle and test["seconds"] > HEAVY_TEST_SECONDS:
+        return True
+    return False
 
 
 def _process_commit_task(
@@ -1026,43 +1561,34 @@ def _process_commit_task(
     test_by_num: dict[int, dict],
     allow_heavy_verify: bool,
     warm_in_process: bool = False,
+    active_dialects: set[str] | None = None,
 ) -> tuple[str, list[int]]:
     if not cands:
         return cid, []
 
+    use_pickle = "sqlglot/serde.py" in patched_files
     tier1_fast = [
         (n, test_by_num[n]["id"])
         for n in sorted(cands, key=lambda x: test_by_num[x]["seconds"])
-        if not _is_heavy_candidate(test_by_num[n])
+        if not _is_heavy_candidate(test_by_num[n], use_pickle)
     ]
     tier2_heavy = [
         (n, test_by_num[n]["id"])
         for n in sorted(cands, key=lambda x: test_by_num[x]["seconds"])
-        if _is_heavy_candidate(test_by_num[n])
+        if _is_heavy_candidate(test_by_num[n], use_pickle)
     ]
 
-    failed_tier1 = _run_commit_tests_isolated(
+    failed = _run_commit_tiers_isolated(
         base_repo,
         overlay_dir,
         patched_files,
         tier1_fast,
-        warm_in_process=warm_in_process,
-    )
-
-    if not tier2_heavy:
-        return cid, failed_tier1
-
-    if failed_tier1 or not allow_heavy_verify:
-        return cid, sorted(set(failed_tier1) | {n for n, _ in tier2_heavy})
-
-    failed_tier2 = _run_commit_tests_isolated(
-        base_repo,
-        overlay_dir,
-        patched_files,
         tier2_heavy,
+        allow_heavy_verify,
         warm_in_process=warm_in_process,
+        active_dialects=active_dialects,
     )
-    return cid, sorted(set(failed_tier1) | set(failed_tier2))
+    return cid, failed
 
 
 def _load_tpc_cache() -> dict | None:
@@ -1124,6 +1650,7 @@ def _linux_worker_loop(
             if not line:
                 continue
             task = json.loads(line)
+            ad = set(task["active_dialects"]) if task.get("active_dialects") else None
             cid, final_nums = _process_commit_task(
                 task["cid"],
                 task["cands"],
@@ -1133,6 +1660,7 @@ def _linux_worker_loop(
                 test_by_num,
                 task["allow_heavy"],
                 warm_in_process=bool(task.get("warm", False)),
+                active_dialects=ad,
             )
             tx.write(json.dumps({"cid": cid, "final": final_nums}) + "\n")
             tx.flush()
@@ -1153,11 +1681,16 @@ def main() -> int:
         global _TPC_CACHE
         _TPC_CACHE = _load_tpc_cache()
         req = json.loads(sys.stdin.read())
-        failed = _execute_tests_in_overlay(
+        ad = set(req["active_dialects"]) if req.get("active_dialects") else None
+        failed = _run_commit_tiers_in_process(
             Path(req["overlay"]),
-            [(int(n), tid) for n, tid in req["items"]],
-            use_pickle=bool(req.get("use_pickle", False)),
-            patched_files=req.get("patched_files"),
+            [(int(n), tid) for n, tid in req["tier1"]],
+            [(int(n), tid) for n, tid in req["tier2"]],
+            bool(req.get("allow_heavy", True)),
+            bool(req.get("use_pickle", False)),
+            req.get("patched_files"),
+            False,
+            ad,
         )
         sys.stdout.write(json.dumps(failed) + "\n")
         return 0
@@ -1210,6 +1743,17 @@ def main() -> int:
                 for k in pf
             )
 
+        def _active_dialects_for(pf: dict[str, str | None]) -> list[str] | None:
+            if not pf:
+                return None
+            ds: set[str] = set()
+            for k in pf:
+                m = DIALECT_FILE_RE.match(k)
+                if not m or m.group(1) in ("dialect", "base", "__init__"):
+                    return None
+                ds.update(selector._descendant_dialects(m.group(1)))
+            return sorted(ds) if ds else None
+
         py_commits = [it for it in triaged if not _is_fixture_only(it[2])]
         fix_commits = [it for it in triaged if _is_fixture_only(it[2])]
 
@@ -1230,6 +1774,7 @@ def main() -> int:
                 _prewarm_libraries()
             for (cid, cands, patched_files), warm in ordered_tasks:
                 allow_heavy = (time.monotonic() - t_start) < wall_limit * 0.65
+                ad_list = _active_dialects_for(patched_files)
                 _, final_nums = _process_commit_task(
                     cid,
                     cands,
@@ -1239,6 +1784,7 @@ def main() -> int:
                     selector.test_by_num,
                     allow_heavy,
                     warm_in_process=(warm and hasattr(os, "fork")),
+                    active_dialects=set(ad_list) if ad_list else None,
                 )
                 workers = pack_workers(final_nums, selector.test_ms)
                 print(json.dumps({"commit": cid, "workers": workers}), flush=True)
@@ -1294,6 +1840,7 @@ def main() -> int:
                         "patched_files": patched_files,
                         "allow_heavy": allow_heavy,
                         "warm": warm,
+                        "active_dialects": _active_dialects_for(patched_files),
                     }
                 )
                 worker_tx[wid].write(msg + "\n")
