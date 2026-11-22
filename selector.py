@@ -452,6 +452,13 @@ class _EarlySubtestFail(BaseException):
     """Raised on first subTest failure so parameterized tests fail in milliseconds."""
 
 
+class _FastTestResult(unittest.TestResult):
+    """Skip expensive traceback/source-line formatting since only pass/fail is needed."""
+
+    def _exc_info_to_string(self, err, test):
+        return ""
+
+
 class _LazyFuture:
     """Defer task execution until .result() so check_file stops on the first failing subtest."""
 
@@ -2951,7 +2958,8 @@ def _install_optimizer_accelerators(
                         ):
                             dialect = meta.get("dialect")
                             expr = mod.parse_one(sql, read=dialect)
-                            if _hash_expr_exact(expr) == parse_hashes.get((dialect or "", sql)):
+                            expected_h = parse_hashes.get((dialect or "", sql))
+                            if expected_h is not None and _hash_expr_exact(expr) == expected_h:
                                 continue
                             title = meta.get("title") or f"{i}, {sql}"
                             func_kwargs = kw.copy()
@@ -3796,6 +3804,86 @@ def _execute_tests_in_overlay(
             orig_va = cls.validate_all
             orig_vi = cls.validate_identity
             orig_po = cls.parse_one
+            def _install_parser_only_validator_hooks(active_check=None):
+                val_parse_hashes = _VAL_CACHE["val_parse_hashes"]
+                from sqlglot import parse_one as _sg_parse_one
+
+                def _fast_parser_only_vi(
+                    self,
+                    sql,
+                    write_sql=None,
+                    pretty=False,
+                    check_command_warning=False,
+                    identify=False,
+                    _orig=orig_vi,
+                    _vph=val_parse_hashes,
+                ):
+                    if _ASSERT_LOGS_DEPTH > 0 or check_command_warning:
+                        return _orig(
+                            self,
+                            sql,
+                            write_sql=write_sql,
+                            pretty=pretty,
+                            check_command_warning=check_command_warning,
+                            identify=identify,
+                        )
+                    expected_h = _vph.get((self.dialect or "", sql))
+                    if expected_h is not None:
+                        expr = self.parse_one(sql)
+                        if _hash_expr_exact(expr) == expected_h:
+                            return expr
+                    return _orig(
+                        self,
+                        sql,
+                        write_sql=write_sql,
+                        pretty=pretty,
+                        check_command_warning=check_command_warning,
+                        identify=identify,
+                    )
+
+                def _fast_parser_only_va(
+                    self,
+                    sql,
+                    read=None,
+                    write=None,
+                    pretty=False,
+                    identify=False,
+                    _orig=orig_va,
+                    _vph=val_parse_hashes,
+                    _acheck=active_check,
+                ):
+                    if _ASSERT_LOGS_DEPTH > 0:
+                        return _orig(
+                            self, sql, read=read, write=write, pretty=pretty, identify=identify
+                        )
+                    if not read and not write:
+                        return
+                    if write:
+                        expected_h = _vph.get((self.dialect or "", sql))
+                        if expected_h is not None and _hash_expr_exact(self.parse_one(sql)) == expected_h:
+                            w_sub = None
+                        else:
+                            w_sub = write
+                    else:
+                        w_sub = None
+                    r_sub = {}
+                    for rk, rsql in (read or {}).items():
+                        if _acheck is not None and rk and "," not in rk and not _acheck(rk):
+                            continue
+                        expected_rh = _vph.get((rk or "", rsql))
+                        if expected_rh is not None and _hash_expr_exact(_sg_parse_one(rsql, rk)) == expected_rh:
+                            continue
+                        r_sub[rk] = rsql
+                    if not r_sub and not w_sub:
+                        return
+                    return _orig(
+                        self, sql, read=r_sub, write=w_sub, pretty=pretty, identify=identify
+                    )
+
+                cls.validate_identity = _fast_parser_only_vi
+                cls.validate_all = _fast_parser_only_va
+                return (has_own_va, orig_va, has_own_vi, orig_vi, has_own_po, orig_po)
+
             if active_dialects:
                 from sqlglot.dialects.dialect import Dialect as _DCls
 
@@ -3855,6 +3943,8 @@ def _execute_tests_in_overlay(
 
                     cls.validate_identity = _fast_vi
                     cls.validate_all = _fast_va
+                elif commit_mode == "parser_only" and _VAL_CACHE is not None:
+                    saved_validator_hooks = _install_parser_only_validator_hooks(_is_active_d)
                 elif pfiles and all(k.startswith("sqlglot/parsers/") for k in pfiles):
                     saved_validator_hooks = (has_own_va, orig_va, has_own_vi, orig_vi, has_own_po, orig_po)
 
@@ -3879,72 +3969,36 @@ def _execute_tests_in_overlay(
                         )
 
                     cls.validate_all = _fast_parser_va
-            elif commit_mode == "parser_only" and _VAL_CACHE is not None:
-                val_parse_hashes = _VAL_CACHE["val_parse_hashes"]
-                saved_validator_hooks = (has_own_va, orig_va, has_own_vi, orig_vi, has_own_po, orig_po)
-                from sqlglot import parse_one as _sg_parse_one
+                elif commit_mode == "gen_only":
+                    saved_validator_hooks = (has_own_va, orig_va, has_own_vi, orig_vi, has_own_po, orig_po)
 
-                def _fast_parser_only_vi(
-                    self,
-                    sql,
-                    write_sql=None,
-                    pretty=False,
-                    check_command_warning=False,
-                    identify=False,
-                    _orig=orig_vi,
-                    _vph=val_parse_hashes,
-                ):
-                    if _ASSERT_LOGS_DEPTH > 0 or check_command_warning:
-                        return _orig(
-                            self,
-                            sql,
-                            write_sql=write_sql,
-                            pretty=pretty,
-                            check_command_warning=check_command_warning,
-                            identify=identify,
-                        )
-                    expr = self.parse_one(sql)
-                    if _hash_expr_exact(expr) == _vph.get((self.dialect or "", sql)):
-                        return expr
-                    return _orig(
+                    def _fast_active_gen_va(
                         self,
                         sql,
-                        write_sql=write_sql,
-                        pretty=pretty,
-                        check_command_warning=check_command_warning,
-                        identify=identify,
-                    )
-
-                def _fast_parser_only_va(
-                    self,
-                    sql,
-                    read=None,
-                    write=None,
-                    pretty=False,
-                    identify=False,
-                    _orig=orig_va,
-                    _vph=val_parse_hashes,
-                ):
-                    if _ASSERT_LOGS_DEPTH > 0:
+                        read=None,
+                        write=None,
+                        pretty=False,
+                        identify=False,
+                        _orig=orig_va,
+                    ):
+                        if _ASSERT_LOGS_DEPTH > 0:
+                            return _orig(
+                                self, sql, read=read, write=write, pretty=pretty, identify=identify
+                            )
+                        w_sub = {
+                            k: v
+                            for k, v in (write or {}).items()
+                            if not k or "," in k or _is_active_d(k)
+                        }
+                        if not read and not w_sub:
+                            return
                         return _orig(
-                            self, sql, read=read, write=write, pretty=pretty, identify=identify
+                            self, sql, read=read, write=w_sub, pretty=pretty, identify=identify
                         )
-                    expr = self.parse_one(sql)
-                    main_ok = _hash_expr_exact(expr) == _vph.get((self.dialect or "", sql))
-                    w_sub = None if main_ok else write
-                    r_sub = {}
-                    for rk, rsql in (read or {}).items():
-                        r_expr = _sg_parse_one(rsql, rk)
-                        if _hash_expr_exact(r_expr) != _vph.get((rk or "", rsql)):
-                            r_sub[rk] = rsql
-                    if not r_sub and not w_sub:
-                        return
-                    return _orig(
-                        self, sql, read=r_sub, write=w_sub, pretty=pretty, identify=identify
-                    )
 
-                cls.validate_identity = _fast_parser_only_vi
-                cls.validate_all = _fast_parser_only_va
+                    cls.validate_all = _fast_active_gen_va
+            elif commit_mode == "parser_only" and _VAL_CACHE is not None:
+                saved_validator_hooks = _install_parser_only_validator_hooks()
             elif commit_mode == "opt_only" and _VAL_CACHE is not None and "val_opt_keys" in _VAL_CACHE:
                 val_opt_keys = _VAL_CACHE["val_opt_keys"]
                 saved_validator_hooks = (has_own_va, orig_va, has_own_vi, orig_vi, has_own_po, orig_po)
@@ -4057,7 +4111,7 @@ def _execute_tests_in_overlay(
                     _LAST_FAILED_SUBTEST_MSG = None
                     _ASSERT_LOGS_DEPTH = 0
                     tc = cls(mname)
-                    res = unittest.TestResult()
+                    res = _FastTestResult()
                     tc.run(res)
                 finally:
                     if saved_dial_classes is not None:
@@ -4266,6 +4320,8 @@ def pack_workers(selected: list[int], test_ms: dict[int, int]) -> list[list[int]
     best_workers: list[list[int]] = []
 
     for k in range(1, max_k + 1):
+        if best_cost is not None and items[0][0] + WORKER_COST_MS * k >= best_cost:
+            break
         buckets: list[list[int]] = [[] for _ in range(k)]
         loads = [0] * k
         for dur, num in items:
@@ -4452,6 +4508,8 @@ def _prewarm_libraries(
     need_tpc: bool = True,
     need_heavy_libs: bool = True,
     need_val_cache: bool = False,
+    need_tpcds_dumps: bool = True,
+    need_in_nulls_dumps: bool = True,
 ) -> None:
     """Pre-import third-party libraries & untouched sqlglot core modules once before os.fork()."""
     global _TPC_CACHE, _VAL_CACHE, _TPCDS_ALL_OPT_DUMPS, _IN_NULLS_OPT_DUMPS, _TPCDS_RAW_DUMPS, _TPCDS_PLAN_EXPR_DUMPS
@@ -4462,19 +4520,20 @@ def _prewarm_libraries(
     if need_tpc and _TPC_CACHE is None:
         _TPC_CACHE = _load_tpc_cache()
     if _TPC_CACHE is not None:
-        if _TPCDS_ALL_OPT_DUMPS is None and "tpcds_all_opt_dumps_z" in _TPC_CACHE:
-            _TPCDS_ALL_OPT_DUMPS = pickle.loads(
-                zlib.decompress(_TPC_CACHE["tpcds_all_opt_dumps_z"])
-            )
-        if _IN_NULLS_OPT_DUMPS is None and "in_nulls_opt_dumps_z" in _TPC_CACHE:
+        if need_tpcds_dumps:
+            if _TPCDS_ALL_OPT_DUMPS is None and "tpcds_all_opt_dumps_z" in _TPC_CACHE:
+                _TPCDS_ALL_OPT_DUMPS = pickle.loads(
+                    zlib.decompress(_TPC_CACHE["tpcds_all_opt_dumps_z"])
+                )
+            if _TPCDS_RAW_DUMPS is None and "tpcds_raw_dumps_z" in _TPC_CACHE:
+                _TPCDS_RAW_DUMPS = pickle.loads(zlib.decompress(_TPC_CACHE["tpcds_raw_dumps_z"]))
+            if _TPCDS_PLAN_EXPR_DUMPS is None and "tpcds_plan_expr_dumps_z" in _TPC_CACHE:
+                _TPCDS_PLAN_EXPR_DUMPS = pickle.loads(
+                    zlib.decompress(_TPC_CACHE["tpcds_plan_expr_dumps_z"])
+                )
+        if need_in_nulls_dumps and _IN_NULLS_OPT_DUMPS is None and "in_nulls_opt_dumps_z" in _TPC_CACHE:
             _IN_NULLS_OPT_DUMPS = pickle.loads(
                 zlib.decompress(_TPC_CACHE["in_nulls_opt_dumps_z"])
-            )
-        if _TPCDS_RAW_DUMPS is None and "tpcds_raw_dumps_z" in _TPC_CACHE:
-            _TPCDS_RAW_DUMPS = pickle.loads(zlib.decompress(_TPC_CACHE["tpcds_raw_dumps_z"]))
-        if _TPCDS_PLAN_EXPR_DUMPS is None and "tpcds_plan_expr_dumps_z" in _TPC_CACHE:
-            _TPCDS_PLAN_EXPR_DUMPS = pickle.loads(
-                zlib.decompress(_TPC_CACHE["tpcds_plan_expr_dumps_z"])
             )
     if need_val_cache and _VAL_CACHE is None:
         _VAL_CACHE = _load_val_cache()
@@ -4624,7 +4683,7 @@ def main() -> int:
         ad = set(req["active_dialects"]) if req.get("active_dialects") else None
         cm = req.get("commit_mode")
         _TPC_CACHE = _load_tpc_cache()
-        if cm in ("parser_only", "opt_only") and not ad:
+        if cm == "parser_only" or (not ad and cm == "opt_only"):
             _VAL_CACHE = _load_val_cache()
         failed = _run_commit_tiers_in_process(
             Path(req["overlay"]),
@@ -4709,19 +4768,26 @@ def main() -> int:
         need_tpc = False
         need_heavy_libs = False
         need_val_cache = False
+        need_tpcds_dumps = False
+        need_in_nulls_dumps = False
         for cid, cands, pf in triaged:
             ad_list = _active_dialects_for(pf)
             cm = _classify_commit_mode(pf, base_repo)
             commit_meta[cid] = (ad_list, cm)
-            if not ad_list and cm in ("parser_only", "opt_only"):
+            if cm == "parser_only" or (not ad_list and cm == "opt_only"):
                 need_val_cache = True
             for n in cands:
-                tf = selector.test_by_num[n]["file"]
+                tinfo = selector.test_by_num[n]
+                tf = tinfo["file"]
+                tid = tinfo["id"]
+                if tid.endswith(("::test_tpcds", "::test_execute_tpcds")):
+                    need_tpcds_dumps = True
+                if cm == "gen_only" and tid.endswith("::test_optimize_in_nulls"):
+                    need_in_nulls_dumps = True
                 if tf in ("tests/test_optimizer.py", "tests/test_executor.py"):
                     need_tpc = True
                     need_heavy_libs = True
-                    break
-                if tf.startswith("tests/dialects/") or tf in (
+                elif tf.startswith("tests/dialects/") or tf in (
                     "tests/test_lineage.py",
                     "tests/test_schema.py",
                     "tests/test_serde.py",
@@ -4749,6 +4815,8 @@ def main() -> int:
                     need_tpc=need_tpc,
                     need_heavy_libs=need_heavy_libs,
                     need_val_cache=need_val_cache,
+                    need_tpcds_dumps=need_tpcds_dumps,
+                    need_in_nulls_dumps=need_in_nulls_dumps,
                 )
             for (cid, cands, patched_files), warm in ordered_tasks:
                 allow_heavy = (time.monotonic() - t_start) < wall_limit * 0.85
@@ -4777,6 +4845,8 @@ def main() -> int:
                 need_tpc=need_tpc,
                 need_heavy_libs=need_heavy_libs,
                 need_val_cache=need_val_cache,
+                need_tpcds_dumps=need_tpcds_dumps,
+                need_in_nulls_dumps=need_in_nulls_dumps,
             )
             sel_io = selectors.DefaultSelector()
             worker_pids: list[int] = []
