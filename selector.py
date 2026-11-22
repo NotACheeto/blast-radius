@@ -17,6 +17,7 @@ import collections
 import concurrent.futures
 from concurrent.futures import Future
 import difflib
+from enum import Enum as _Enum
 import gzip
 import hashlib
 import importlib
@@ -74,80 +75,81 @@ def _hash_expr_dump(dump_obj) -> bytes:
     return hashlib.blake2b(pickle.dumps(dump_obj, protocol=4), digest_size=12).digest()
 
 
+_NO_ATTR = object()
+_TYPE_NAME_BYTES: dict[type, bytes] = {}
+_ARG_KEY_BYTES: dict[str, bytes] = {}
+
+
+def _hash_walk(v, upd) -> None:
+    if v is None:
+        upd(b"N")
+        return
+    if getattr(v, "_type", _NO_ATTR) is not _NO_ATTR and getattr(v, "args", _NO_ATTR) is not _NO_ATTR:
+        tv = type(v)
+        tb = _TYPE_NAME_BYTES.get(tv)
+        if tb is None:
+            tb = b"E" + tv.__name__.encode("utf-8") + b"\0"
+            _TYPE_NAME_BYTES[tv] = tb
+        upd(tb)
+        _hash_walk(v._type, upd)
+        _hash_walk(v.comments, upd)
+        _hash_walk(v._meta, upd)
+        args = v.args
+        upd(len(args).to_bytes(4, "little"))
+        for k in sorted(args):
+            kb = _ARG_KEY_BYTES.get(k)
+            if kb is None:
+                kb = k.encode("utf-8") + b":"
+                _ARG_KEY_BYTES[k] = kb
+            upd(kb)
+            _hash_walk(args[k], upd)
+        return
+    tv = type(v)
+    if tv is bool:
+        upd(b"T" if v else b"F")
+    elif isinstance(v, _Enum):
+        upd(b"M")
+        tb = _TYPE_NAME_BYTES.get(tv)
+        if tb is None:
+            tb = tv.__name__.encode("utf-8") + b":"
+            _TYPE_NAME_BYTES[tv] = tb
+        upd(tb)
+        upd(v.name.encode("utf-8"))
+    elif tv is int:
+        upd(b"I" + str(v).encode("ascii") + b"\0")
+    elif tv is float:
+        upd(b"R")
+        upd(b"NAN" if math.isnan(v) else repr(v).encode("ascii"))
+        upd(b"\0")
+    elif tv is str:
+        b = v.encode("utf-8")
+        upd(b"S" + len(b).to_bytes(4, "little") + b)
+    elif tv is list:
+        upd(b"L" + len(v).to_bytes(4, "little"))
+        for item in v:
+            _hash_walk(item, upd)
+    elif tv is tuple:
+        upd(b"P" + len(v).to_bytes(4, "little"))
+        for item in v:
+            _hash_walk(item, upd)
+    elif isinstance(v, dict):
+        upd(b"D" + len(v).to_bytes(4, "little"))
+        for dk in sorted(v, key=lambda x: (type(x).__name__, str(x))):
+            _hash_walk(dk, upd)
+            _hash_walk(v[dk], upd)
+    elif isinstance(v, (set, frozenset)):
+        upd(b"Z" + len(v).to_bytes(4, "little"))
+        for s in sorted(_hash_expr_exact(item) for item in v):
+            upd(s)
+    else:
+        b = f"{tv.__name__}:{v!r}".encode("utf-8", errors="replace")
+        upd(b"O" + len(b).to_bytes(4, "little") + b)
+
+
 def _hash_expr_exact(obj) -> bytes:
     """Lossless deterministic 12-byte hash over Expr ASTs, types, comments, meta, and containers."""
-    from enum import Enum
-
     h = hashlib.blake2b(digest_size=12)
-    upd = h.update
-
-    def _walk(v) -> None:
-        if v is None:
-            upd(b"N")
-            return
-        if hasattr(v, "args") and hasattr(v, "_type"):
-            upd(b"E")
-            upd(type(v).__name__.encode("utf-8"))
-            upd(b"\0")
-            _walk(v._type)
-            _walk(v.comments)
-            _walk(v._meta)
-            args = v.args
-            upd(len(args).to_bytes(4, "little"))
-            for k in sorted(args):
-                upd(k.encode("utf-8"))
-                upd(b":")
-                _walk(args[k])
-            return
-        tv = type(v)
-        if tv is bool:
-            upd(b"T" if v else b"F")
-        elif isinstance(v, Enum):
-            upd(b"M")
-            upd(tv.__name__.encode("utf-8"))
-            upd(b":")
-            upd(v.name.encode("utf-8"))
-        elif tv is int:
-            upd(b"I")
-            upd(str(v).encode("ascii"))
-            upd(b"\0")
-        elif tv is float:
-            upd(b"R")
-            upd(b"NAN" if math.isnan(v) else repr(v).encode("ascii"))
-            upd(b"\0")
-        elif tv is str:
-            b = v.encode("utf-8")
-            upd(b"S")
-            upd(len(b).to_bytes(4, "little"))
-            upd(b)
-        elif tv is list:
-            upd(b"L")
-            upd(len(v).to_bytes(4, "little"))
-            for item in v:
-                _walk(item)
-        elif tv is tuple:
-            upd(b"P")
-            upd(len(v).to_bytes(4, "little"))
-            for item in v:
-                _walk(item)
-        elif isinstance(v, dict):
-            upd(b"D")
-            upd(len(v).to_bytes(4, "little"))
-            for dk in sorted(v, key=lambda x: (type(x).__name__, str(x))):
-                _walk(dk)
-                _walk(v[dk])
-        elif isinstance(v, (set, frozenset)):
-            upd(b"Z")
-            upd(len(v).to_bytes(4, "little"))
-            for s in sorted(_hash_expr_exact(item) for item in v):
-                upd(s)
-        else:
-            b = f"{tv.__name__}:{v!r}".encode("utf-8", errors="replace")
-            upd(b"O")
-            upd(len(b).to_bytes(4, "little"))
-            upd(b)
-
-    _walk(obj)
+    _hash_walk(obj, h.update)
     return h.digest()
 
 
@@ -2502,6 +2504,7 @@ def _patch_test_executor_with_cache(
                 idx for idx in indices if idx != _COMMIT_TPCDS_FAILED_IDX
             ]
         reused_opt_verified = False
+        py_exec = None
 
         for i in indices:
             meta, sql, _ = sqls[i]
@@ -2540,7 +2543,9 @@ def _patch_test_executor_with_cache(
                         else None
                     )
                     if pe_d is not None and tpcds_dump_py_hashes and i in tpcds_dump_py_hashes:
-                        py_gen = mod.PythonExecutor().generator
+                        if py_exec is None:
+                            py_exec = mod.PythonExecutor()
+                        py_gen = py_exec.generator
                         chk_out = sorted(
                             f"{tag}:{py_gen.generate(_exp.Expr.load(d))}" for tag, d in pe_d
                         )
@@ -2552,8 +2557,10 @@ def _patch_test_executor_with_cache(
                     else:
                         opt_expr = _exp.Expr.load(tpcds_opt_dumps[i])
                         plan = mod.Plan(opt_expr)
+                        if py_exec is None:
+                            py_exec = mod.PythonExecutor()
                         if tpcds_dump_py_hashes and i in tpcds_dump_py_hashes and (
-                            _plan_py_hash(mod.PythonExecutor(), plan, _planner)
+                            _plan_py_hash(py_exec, plan, _planner)
                             == tpcds_dump_py_hashes[i]
                         ):
                             continue
@@ -4379,7 +4386,13 @@ def _process_commit_task(
     ]
     tier2_heavy = [
         (n, test_by_num[n]["id"])
-        for n in sorted(cands, key=lambda x: test_by_num[x]["seconds"])
+        for n in sorted(
+            cands,
+            key=lambda x: (
+                0 if test_by_num[x]["id"] == "tests/test_optimizer.py::TestOptimizer::test_tpcds" else 1,
+                test_by_num[x]["seconds"],
+            ),
+        )
         if _is_heavy_candidate(test_by_num[n], use_pickle)
     ]
 
