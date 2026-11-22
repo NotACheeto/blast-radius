@@ -2903,6 +2903,8 @@ def _install_optimizer_accelerators(
                     )
                     if next_r is None or (next_r - tr - 1) >= 4:
                         hop_targets[tr] = next_r
+            if first_r == 0 and not hop_targets:
+                return None
 
             def _get_ckpt(r_idx: int):
                 ck_key = (suite_key, r_idx)
@@ -4223,7 +4225,8 @@ def _execute_tests_in_overlay(
                     cls.validate_all = _fast_parser_va
                 elif commit_mode == "gen_only":
                     if (
-                        "sqlglot/transforms.py" not in pfiles
+                        "sqlglot/generator.py" in pfiles
+                        and "sqlglot/transforms.py" not in pfiles
                         and _VAL_CACHE is not None
                         and "val_asts_z" in _VAL_CACHE
                         and not has_own_po
@@ -4956,7 +4959,7 @@ def main() -> int:
         ad = set(req["active_dialects"]) if req.get("active_dialects") else None
         cm = req.get("commit_mode")
         _TPC_CACHE = _load_tpc_cache()
-        if cm in ("parser_only", "gen_only") or (not ad and cm == "opt_only"):
+        if cm == "parser_only" or (cm == "gen_only" and "sqlglot/generator.py" in (req.get("patched_files") or {})) or (not ad and cm == "opt_only"):
             _VAL_CACHE = _load_val_cache()
         failed = _run_commit_tiers_in_process(
             Path(req["overlay"]),
@@ -5048,7 +5051,7 @@ def main() -> int:
             ad_list = _active_dialects_for(pf)
             cm = _classify_commit_mode(pf, base_repo)
             commit_meta[cid] = (ad_list, cm)
-            if cm == "gen_only" and "sqlglot/transforms.py" not in pf:
+            if cm == "gen_only" and "sqlglot/generator.py" in pf and "sqlglot/transforms.py" not in pf:
                 need_val_cache = True
                 need_val_asts = True
             elif cm == "parser_only" or (not ad_list and cm == "opt_only"):
