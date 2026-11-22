@@ -2779,6 +2779,7 @@ def _install_optimizer_accelerators(
                 from sqlglot import exp as _exp
 
                 af_parse_hashes = _afm["parse_hashes"]
+                dt_cache: dict[tuple[str, str], tuple[bytes, object]] = {}
                 test_schema = {
                     "tbl": {
                         "bin_col": "BINARY",
@@ -2808,8 +2809,14 @@ def _install_optimizer_accelerators(
                     sql_full = f"SELECT {sql_raw} FROM tbl"
                     for d_one in dialect_s.split(", "):
                         expr = mod.parse_one(sql_full, read=d_one)
-                        exp_dt = _exp.DataType.build(expected, dialect=d_one)
-                        pair_h = (_hash_expr_exact(expr), _hash_expr_exact(exp_dt))
+                        dt_key = (d_one, expected)
+                        dt_entry = dt_cache.get(dt_key)
+                        if dt_entry is None:
+                            exp_dt = _exp.DataType.build(expected, dialect=d_one)
+                            dt_entry = (_hash_expr_exact(exp_dt), exp_dt)
+                            dt_cache[dt_key] = dt_entry
+                        exp_dt_h, exp_dt = dt_entry
+                        pair_h = (_hash_expr_exact(expr), exp_dt_h)
                         if pair_h == af_parse_hashes.get((d_one, sql_full, expected)):
                             continue
                         with self.subTest(title):
