@@ -9,8 +9,8 @@ RUN pip install --no-cache-dir -r /app/requirements.lock && \
     python -m compileall -q /app/sqlglot && \
     chmod -R a+rX /app
 
-COPY blast_map.json.gz tpc_cache.pkl.gz selector.py /app/
-RUN chmod a+r /app/blast_map.json.gz /app/tpc_cache.pkl.gz /app/selector.py
+COPY blast_map.pkl.gz tpc_cache.pkl.gz val_cache.pkl.gz selector.py /app/
+RUN chmod a+r /app/blast_map.pkl.gz /app/tpc_cache.pkl.gz /app/val_cache.pkl.gz /app/selector.py
 
 ENV PYTHONPATH=/app/sqlglot SKIP_INTEGRATION=0 PYTHONDONTWRITEBYTECODE=1 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONHASHSEED=0
 CMD ["python", "/app/selector.py"]
