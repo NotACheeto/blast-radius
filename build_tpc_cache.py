@@ -528,12 +528,106 @@ def main() -> int:
         pickle.dumps(tpcds_plan_expr_dumps, protocol=4), level=9
     )
 
+    # Pre-compute per-rule checkpoints for tpc-h, optimizer.sql, and in_nulls
+    opt_rule_file_sets: list[set[str]] = [set(s) for s in tpcds_rule_file_sets]
+
+    def _build_suite_rule_ckpts(items_iter, specs=None):
+        r_specs = specs or rule_specs
+        r_hashes: list[list[bytes]] = [[] for _ in RULES]
+        r_ckpts: dict[int, list[object]] = {r_idx: [] for r_idx in range(len(RULES) - 1)}
+        nonlocal cur_rule_idx
+        T_ID = sys.monitoring.PROFILER_ID
+        sys.monitoring.use_tool_id(T_ID, "tpc_cache_suite_rules")
+        def _on_py(code, offset):
+            if cur_rule_idx < 0:
+                return sys.monitoring.DISABLE
+            rel = _classify_rel(code)
+            if rel is not None:
+                opt_rule_file_sets[cur_rule_idx].add(rel)
+            return sys.monitoring.DISABLE
+        sys.monitoring.register_callback(T_ID, sys.monitoring.events.PY_START, _on_py)
+        try:
+            for cur, q_kwargs in items_iter:
+                for r_idx, (rule_fn, params) in enumerate(r_specs):
+                    cur_rule_idx = r_idx
+                    sys.monitoring.set_events(T_ID, sys.monitoring.events.PY_START)
+                    sys.monitoring.restart_events()
+                    try:
+                        cur = rule_fn(cur, **{p: q_kwargs[p] for p in params})
+                    finally:
+                        sys.monitoring.set_events(T_ID, 0)
+                        cur_rule_idx = -1
+                    h_cur = _hash_expr_exact(cur)
+                    r_hashes[r_idx].append(h_cur)
+                    if r_idx < len(RULES) - 1:
+                        p_obj = _pack_expr(cur)
+                        try:
+                            ok_rt = _hash_expr_exact(_unpack_expr(p_obj, exp)) == h_cur
+                        except Exception:
+                            ok_rt = False
+                        r_ckpts[r_idx].append(p_obj if ok_rt else None)
+        finally:
+            sys.monitoring.set_events(T_ID, 0)
+            sys.monitoring.free_tool_id(T_ID)
+        ckpts_z = {
+            r_idx: zlib.compress(pickle.dumps(ckpt_list, protocol=4), level=9)
+            for r_idx, ckpt_list in r_ckpts.items()
+        }
+        return r_hashes, ckpts_z
+
+    tpch_opt_pairs = list(th.load_sql_fixture_pairs("optimizer/tpc-h/tpc-h.sql"))
+    tpch_kwargs = dict(possible_kwargs)
+    tpch_kwargs["schema"] = ensure_schema(th.TPCH_SCHEMA)
+    tpch_kwargs["isolate_tables"] = False
+    tpch_kwargs["quote_identifiers"] = True
+    tpch_rule_hashes, tpch_rule_checkpoints_z = _build_suite_rule_ckpts(
+        (parse_one(sql), tpch_kwargs) for _, sql, _ in tpch_opt_pairs
+    )
+
+    opt_sql_pairs = list(th.load_sql_fixture_pairs("optimizer/optimizer.sql"))
+    opt_base_schema_dict = {
+        "x": {"a": "INT", "b": "INT"},
+        "y": {"b": "INT", "c": "INT"},
+        "z": {"a": "INT", "c": "INT"},
+        "u": {"f": "INT", "g": "INT", "h": "TEXT"},
+    }
+    opt_rule_specs = [
+        (r, [p for p in inspect.getfullargspec(r).args if p in (set(possible_kwargs) | {"validate_qualify_columns", "canonicalize_table_aliases", "leave_tables_isolated"})])
+        for r in RULES
+    ]
+    def _opt_sql_items():
+        import json as _json
+        for meta, sql, _ in opt_sql_pairs:
+            d = meta.get("dialect")
+            q_kw = dict(possible_kwargs)
+            q_kw["isolate_tables"] = False
+            q_kw["leave_tables_isolated"] = False
+            q_kw["quote_identifiers"] = True
+            q_kw["validate_qualify_columns"] = True
+            q_kw["canonicalize_table_aliases"] = False
+            q_kw["schema"] = ensure_schema(
+                _json.loads(meta["schema"]) if meta.get("schema") else opt_base_schema_dict,
+                dialect=d,
+            )
+            if (lti := meta.get("leave_tables_isolated")) is not None:
+                q_kw["leave_tables_isolated"] = th.string_to_bool(lti)
+            if (vqc := meta.get("validate_qualify_columns")) is not None:
+                q_kw["validate_qualify_columns"] = th.string_to_bool(vqc)
+            if d:
+                q_kw["dialect"] = d
+            if (cta := meta.get("canonicalize_table_aliases")) is not None:
+                q_kw["canonicalize_table_aliases"] = th.string_to_bool(cta)
+            yield parse_one(sql, read=d), q_kw
+
+    opt_rule_hashes, opt_rule_checkpoints_z = _build_suite_rule_ckpts(_opt_sql_items(), specs=opt_rule_specs)
+
     # Pre-compute test_optimize_in_nulls DuckDB-optimized baseline SQL strings, parse hashes & dumps
     to_inst = to.TestOptimizer("test_optimize_in_nulls")
     to_inst.setUp()
     in_nulls_opt_duck: list[str] = []
     in_nulls_parse_hashes: list[bytes] = []
     in_nulls_opt_dumps: list[list[dict] | None] = []
+    in_nulls_sqls: list[str] = []
     for where in (
         "",
         " WHERE y.b IS NOT NULL",
@@ -564,6 +658,7 @@ def main() -> int:
                 f"SELECT x.a FROM x GROUP BY x.a HAVING ({predicate}) IS NULL",
                 f"SELECT x.a FROM x ORDER BY ({predicate}), x.a",
             ):
+                in_nulls_sqls.append(sql)
                 in_nulls_parse_hashes.append(
                     _hash_expr_exact(parse_one(sql, read="duckdb"))
                 )
@@ -579,6 +674,19 @@ def main() -> int:
     in_nulls_opt_dumps_z = zlib.compress(
         pickle.dumps(in_nulls_opt_dumps, protocol=4), level=9
     )
+    in_nulls_kwargs = {
+        "db": None,
+        "catalog": None,
+        "schema": ensure_schema(to_inst.schema),
+        "dialect": "duckdb",
+        "sql": None,
+        "isolate_tables": False,
+        "quote_identifiers": True,
+    }
+    in_nulls_rule_hashes, in_nulls_rule_checkpoints_z = _build_suite_rule_ckpts(
+        (parse_one(s, read="duckdb"), in_nulls_kwargs) for s in in_nulls_sqls
+    )
+    opt_rule_files = [sorted(s) for s in opt_rule_file_sets]
 
     # Record DuckDB caches AND TestOptimizer check_file fixture metadata
     duck_rows_cache: dict[bytes, list] = {}
@@ -1020,6 +1128,13 @@ def main() -> int:
         "tpcds_rule_files": tpcds_rule_files,
         "tpcds_rule_hashes": tpcds_rule_hashes,
         "tpcds_rule_checkpoints_z": tpcds_rule_checkpoints_z,
+        "opt_rule_files": opt_rule_files,
+        "tpch_rule_hashes": tpch_rule_hashes,
+        "tpch_rule_checkpoints_z": tpch_rule_checkpoints_z,
+        "opt_rule_hashes": opt_rule_hashes,
+        "opt_rule_checkpoints_z": opt_rule_checkpoints_z,
+        "in_nulls_rule_hashes": in_nulls_rule_hashes,
+        "in_nulls_rule_checkpoints_z": in_nulls_rule_checkpoints_z,
         "tpcds_all_opt_dumps_z": tpcds_all_opt_dumps_z,
         "tpcds_no_gen_mask": tpcds_no_gen_mask,
         "opt_fixture_meta": final_opt_fixture_meta,
@@ -1051,6 +1166,7 @@ def main() -> int:
         import tests.dialects.test_dialect as td
 
         val_parse_hashes: dict[tuple[str, str], bytes] = {}
+        val_asts: dict[tuple[str, str], object] = {}
         val_opt_keys: set[tuple[str, str]] = set()
         bad_parse_keys: set[tuple[str, str]] = set()
 
@@ -1123,6 +1239,13 @@ def main() -> int:
                     key = (self.dialect or "", sql)
                     if v_trace["pt_calls"] == pt0 and key not in bad_parse_keys:
                         val_parse_hashes[key] = h
+                        if key not in val_asts:
+                            p_obj = _pack_expr(expr_obj)
+                            try:
+                                if _hash_expr_exact(_unpack_expr(p_obj, exp)) == h:
+                                    val_asts[key] = p_obj
+                            except Exception:
+                                pass
                     else:
                         bad_parse_keys.add(key)
                     return expr_obj
@@ -1161,6 +1284,13 @@ def main() -> int:
                         r_key = (read_dialect or "", read_sql)
                         if v_trace["pt_calls"] == pt0 and r_key not in bad_parse_keys:
                             val_parse_hashes[r_key] = r_hash
+                            if r_key not in val_asts:
+                                p_obj = _pack_expr(r_expr)
+                                try:
+                                    if _hash_expr_exact(_unpack_expr(p_obj, exp)) == r_hash:
+                                        val_asts[r_key] = p_obj
+                                except Exception:
+                                    pass
                         else:
                             bad_parse_keys.add(r_key)
 
@@ -1183,6 +1313,13 @@ def main() -> int:
                 m_key = (self.dialect or "", sql)
                 if v_trace["pt_calls"] == pt_w0 and m_key not in bad_parse_keys:
                     val_parse_hashes[m_key] = h_main
+                    if m_key not in val_asts:
+                        p_obj = _pack_expr(expression)
+                        try:
+                            if _hash_expr_exact(_unpack_expr(p_obj, exp)) == h_main:
+                                val_asts[m_key] = p_obj
+                        except Exception:
+                            pass
                 else:
                     bad_parse_keys.add(m_key)
             finally:
@@ -1216,10 +1353,13 @@ def main() -> int:
 
         for k in bad_parse_keys:
             val_parse_hashes.pop(k, None)
+            val_asts.pop(k, None)
 
+        val_asts_z = zlib.compress(pickle.dumps(val_asts, protocol=4), level=9)
         val_payload = {
             "val_parse_hashes": val_parse_hashes,
             "val_opt_keys": val_opt_keys,
+            "val_asts_z": val_asts_z,
         }
         val_raw = pickle.dumps(val_payload, protocol=4)
         with gzip.open(val_out_path, "wb", compresslevel=9) as gz:

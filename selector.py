@@ -44,7 +44,9 @@ HEAVY_TEST_SECONDS = 0.8
 
 _TPC_CACHE: dict | None = None
 _VAL_CACHE: dict | None = None
+_VAL_ASTS: dict | None = None
 _TPCDS_RULE_CKPT_CACHE: dict[int, list] = {}
+_SUITE_RULE_CKPT_CACHE: dict[tuple[str, int], list] = {}
 _TPCDS_ALL_OPT_DUMPS: list | None = None
 _IN_NULLS_OPT_DUMPS: list | None = None
 _TPCDS_RAW_DUMPS: dict | None = None
@@ -2870,6 +2872,82 @@ def _install_optimizer_accelerators(
 
             cls.test_annotate_funcs = _fast_annotate_funcs
 
+        def _prepare_opt_rule_plan(suite_key: str, rule_files_key: str, hashes_key: str, ckpts_key: str, extra_kw: tuple[str, ...] = ()):
+            rule_files = _TPC_CACHE.get(rule_files_key)
+            rule_hashes = _TPC_CACHE.get(hashes_key)
+            rule_ckpts_z = _TPC_CACHE.get(ckpts_key)
+            if not (rule_files and rule_hashes and rule_ckpts_z):
+                return None
+            touched_sorted = sorted(
+                r_idx for r_idx, rfiles in enumerate(rule_files) if set(rfiles) & set(pfiles)
+            )
+            if not touched_sorted:
+                return None
+            touched_set = set(touched_sorted)
+            from sqlglot.optimizer import RULES as _RULES
+
+            n_rules = len(_RULES)
+            valid_params = {"db", "catalog", "schema", "dialect", "sql", "isolate_tables", "quote_identifiers", *extra_kw}
+            rule_specs = [
+                (r, [p for p in inspect.getfullargspec(r).args if p in valid_params])
+                for r in _RULES
+            ]
+            first_r = touched_sorted[0]
+            hop_targets: dict[int, int | None] = {}
+            for tr_pos, tr in enumerate(touched_sorted):
+                if (tr + 1) not in touched_set:
+                    next_r = (
+                        touched_sorted[tr_pos + 1]
+                        if tr_pos + 1 < len(touched_sorted)
+                        else None
+                    )
+                    if next_r is None or (next_r - tr - 1) >= 4:
+                        hop_targets[tr] = next_r
+
+            def _get_ckpt(r_idx: int):
+                ck_key = (suite_key, r_idx)
+                if ck_key not in _SUITE_RULE_CKPT_CACHE:
+                    raw_z = rule_ckpts_z.get(r_idx)
+                    if raw_z is None:
+                        return None
+                    _SUITE_RULE_CKPT_CACHE[ck_key] = pickle.loads(zlib.decompress(raw_z))
+                return _SUITE_RULE_CKPT_CACHE[ck_key]
+
+            return n_rules, rule_specs, first_r, hop_targets, rule_hashes, rule_ckpts_z, _get_ckpt
+
+        def _eval_opt_rule_query(plan, idx: int, sql: str, read_dialect, q_kwargs: dict, _exp):
+            n_rules, rule_specs, first_r, hop_targets, rule_hashes, rule_ckpts_z, _get_ckpt = plan
+            cur = None
+            r_idx = 0
+            if first_r > 0 and (first_r - 1) in rule_ckpts_z:
+                ck_list = _get_ckpt(first_r - 1)
+                if ck_list is not None and ck_list[idx] is not None:
+                    cur = _unpack_expr(ck_list[idx], _exp)
+                    r_idx = first_r
+            if cur is None:
+                cur = mod.parse_one(sql, read=read_dialect)
+                r_idx = 0
+
+            diverged = False
+            while r_idx < n_rules:
+                r_fn, params = rule_specs[r_idx]
+                cur = r_fn(cur, **{p: q_kwargs[p] for p in params})
+                if not diverged and r_idx in hop_targets:
+                    if _hash_expr_exact(cur) == rule_hashes[r_idx][idx]:
+                        next_r = hop_targets[r_idx]
+                        if next_r is None:
+                            return None
+                        if (next_r - 1) in rule_ckpts_z:
+                            ck_list = _get_ckpt(next_r - 1)
+                            if ck_list is not None and ck_list[idx] is not None:
+                                cur = _unpack_expr(ck_list[idx], _exp)
+                                r_idx = next_r
+                                continue
+                    else:
+                        diverged = True
+                r_idx += 1
+            return cur
+
         def _stage_isolated_check_file(
             self, file, func, pretty=False, execute=None, only=None, **kw
         ):
@@ -2878,89 +2956,59 @@ def _install_optimizer_accelerators(
 
             from sqlglot import exp as _exp
 
-            if commit_mode == "opt_only" and file == "tpc-ds/tpc-ds" and "sqlglot/optimizer/optimizer.py" not in pfiles:
-                rule_files = _TPC_CACHE.get("tpcds_rule_files")
-                rule_hashes = _TPC_CACHE.get("tpcds_rule_hashes")
-                rule_ckpts_z = _TPC_CACHE.get("tpcds_rule_checkpoints_z")
-                if rule_files and rule_hashes and rule_ckpts_z:
-                    touched_sorted = sorted(
-                        r_idx for r_idx, rfiles in enumerate(rule_files) if set(rfiles) & set(pfiles)
-                    )
-                    if touched_sorted:
-                        touched_set = set(touched_sorted)
-                        from sqlglot.optimizer import RULES as _RULES
+            if commit_mode == "opt_only" and "sqlglot/optimizer/optimizer.py" not in pfiles:
+                suite_cfg = None
+                if file == "tpc-ds/tpc-ds":
+                    suite_cfg = ("tpcds", "tpcds_rule_files", "tpcds_rule_hashes", "tpcds_rule_checkpoints_z", (), True, False)
+                elif file == "tpc-h/tpc-h" and "opt_rule_files" in _TPC_CACHE:
+                    suite_cfg = ("tpch", "opt_rule_files", "tpch_rule_hashes", "tpch_rule_checkpoints_z", (), False, True)
+                elif file == "optimizer" and "opt_rule_files" in _TPC_CACHE and func is mod.optimizer.optimize:
+                    suite_cfg = ("opt", "opt_rule_files", "opt_rule_hashes", "opt_rule_checkpoints_z", ("validate_qualify_columns", "canonicalize_table_aliases", "leave_tables_isolated"), False, True)
+                if suite_cfg is not None:
+                    sk, rfk, rhk, rck, ekw, def_iso, def_qi = suite_cfg
+                    plan = _prepare_opt_rule_plan(sk, rfk, rhk, rck, ekw)
+                    if plan is not None:
                         from sqlglot.schema import ensure_schema as _ensure_schema
 
-                        n_rules = len(_RULES)
-
-                        def _get_ckpt(r_idx: int):
-                            if r_idx not in _TPCDS_RULE_CKPT_CACHE:
-                                raw_z = rule_ckpts_z.get(r_idx)
-                                if raw_z is None:
-                                    return None
-                                _TPCDS_RULE_CKPT_CACHE[r_idx] = pickle.loads(zlib.decompress(raw_z))
-                            return _TPCDS_RULE_CKPT_CACHE[r_idx]
-
-                        opt_schema = _ensure_schema(kw.get("schema"))
-                        possible_kwargs = {
+                        base_schema_raw = kw.get("schema")
+                        base_kwargs = {
                             "db": kw.get("db"),
                             "catalog": kw.get("catalog"),
-                            "schema": opt_schema,
+                            "schema": _ensure_schema(base_schema_raw, dialect=kw.get("dialect")),
                             "dialect": kw.get("dialect"),
                             "sql": None,
-                            "isolate_tables": True,
-                            "quote_identifiers": False,
+                            "isolate_tables": def_iso,
+                            "quote_identifiers": def_qi,
+                            "validate_qualify_columns": True,
+                            "canonicalize_table_aliases": False,
+                            "leave_tables_isolated": False,
                         }
-                        rule_specs = [
-                            (r, [p for p in inspect.getfullargspec(r).args if p in possible_kwargs])
-                            for r in _RULES
-                        ]
-                        first_r = touched_sorted[0]
-                        hop_targets: dict[int, int | None] = {}
-                        for tr_pos, tr in enumerate(touched_sorted):
-                            if (tr + 1) not in touched_set:
-                                next_r = (
-                                    touched_sorted[tr_pos + 1]
-                                    if tr_pos + 1 < len(touched_sorted)
-                                    else None
-                                )
-                                if next_r is None or (next_r - tr - 1) >= 4:
-                                    hop_targets[tr] = next_r
                         pairs = list(mod.load_sql_fixture_pairs(f"optimizer/{file}.sql"))
                         for idx, (meta, sql, expected) in enumerate(pairs):
                             title = meta.get("title") or f"{idx + 1}, {sql}"
+                            d = meta.get("dialect") or kw.get("dialect")
+                            q_kw = base_kwargs.copy()
+                            if schema_s := meta.get("schema"):
+                                q_kw["schema"] = _ensure_schema(mod.json.loads(schema_s), dialect=d)
+                            elif d != kw.get("dialect") and isinstance(base_schema_raw, dict):
+                                q_kw["schema"] = _ensure_schema(base_schema_raw, dialect=d)
+                            if (lti := meta.get("leave_tables_isolated")) is not None:
+                                q_kw["leave_tables_isolated"] = mod.string_to_bool(lti)
+                            if (vqc := meta.get("validate_qualify_columns")) is not None:
+                                q_kw["validate_qualify_columns"] = mod.string_to_bool(vqc)
+                            if d:
+                                q_kw["dialect"] = d
+                            if (cta := meta.get("canonicalize_table_aliases")) is not None:
+                                q_kw["canonicalize_table_aliases"] = mod.string_to_bool(cta)
+                            fixture_execute = (
+                                False if execute is False else meta.get("execute", execute)
+                            )
+                            if min_python := meta.get("execute_min_python"):
+                                fixture_execute = mod.string_to_bool(
+                                    fixture_execute
+                                ) and sys.version_info >= tuple(map(int, min_python.split(".")))
                             with self.subTest(title):
-                                cur = None
-                                r_idx = 0
-                                if first_r > 0 and (first_r - 1) in rule_ckpts_z:
-                                    ck_list = _get_ckpt(first_r - 1)
-                                    if ck_list is not None and ck_list[idx] is not None:
-                                        cur = _unpack_expr(ck_list[idx], _exp)
-                                        r_idx = first_r
-                                if cur is None:
-                                    cur = mod.parse_one(sql)
-                                    r_idx = 0
-
-                                diverged = False
-                                while r_idx < n_rules:
-                                    r_fn, params = rule_specs[r_idx]
-                                    cur = r_fn(cur, **{p: possible_kwargs[p] for p in params})
-                                    if not diverged and r_idx in hop_targets:
-                                        if _hash_expr_exact(cur) == rule_hashes[r_idx][idx]:
-                                            next_r = hop_targets[r_idx]
-                                            if next_r is None:
-                                                cur = None
-                                                break
-                                            if (next_r - 1) in rule_ckpts_z:
-                                                ck_list = _get_ckpt(next_r - 1)
-                                                if ck_list is not None and ck_list[idx] is not None:
-                                                    cur = _unpack_expr(ck_list[idx], _exp)
-                                                    r_idx = next_r
-                                                    continue
-                                        else:
-                                            diverged = True
-                                    r_idx += 1
-
+                                cur = _eval_opt_rule_query(plan, idx, sql, meta.get("dialect"), q_kw, _exp)
                                 if cur is not None:
                                     for expression in cur.walk():
                                         for arg_key, arg in expression.args.items():
@@ -2969,8 +3017,18 @@ def _install_optimizer_accelerators(
                                                     assert child.arg_key == arg_key
                                                     assert child.parent is expression
                                     self.assertEqual(
-                                        expected, cur.sql(pretty=pretty, dialect=kw.get("dialect"))
+                                        expected, cur.sql(pretty=pretty, dialect=d)
                                     )
+                                    if mod.string_to_bool(fixture_execute):
+                                        with self.subTest(f"(execute) {title}"):
+                                            dfs = []
+                                            for e2 in (mod.parse_one(sql, read=meta.get("dialect")), cur):
+                                                if not isinstance(e2, (_exp.Query, _exp.Values)):
+                                                    e2 = _exp.select(_exp.alias_(e2, "_col_0"))
+                                                dfs.append(
+                                                    self.conn.execute(e2.sql(dialect="duckdb")).df()
+                                                )
+                                            mod.assert_frame_equal(*dfs)
                         return
 
             if commit_mode == "parser_only":
@@ -3198,6 +3256,31 @@ def _install_optimizer_accelerators(
                 _IN_NULLS_OPT_DUMPS = pickle.loads(
                     zlib.decompress(_TPC_CACHE["in_nulls_opt_dumps_z"])
                 )
+            opt_plan = None
+            in_nulls_kw = None
+            if (
+                commit_mode == "opt_only"
+                and not has_opt_fixture_edit
+                and "sqlglot/optimizer/optimizer.py" not in pfiles
+                and "opt_rule_files" in _TPC_CACHE
+                and "in_nulls_rule_hashes" in _TPC_CACHE
+                and "in_nulls_rule_checkpoints_z" in _TPC_CACHE
+            ):
+                opt_plan = _prepare_opt_rule_plan(
+                    "in_nulls", "opt_rule_files", "in_nulls_rule_hashes", "in_nulls_rule_checkpoints_z"
+                )
+                if opt_plan is not None:
+                    from sqlglot.schema import ensure_schema as _ensure_schema
+
+                    in_nulls_kw = {
+                        "db": None,
+                        "catalog": None,
+                        "schema": _ensure_schema(self.schema, dialect="duckdb"),
+                        "dialect": "duckdb",
+                        "sql": None,
+                        "isolate_tables": False,
+                        "quote_identifiers": True,
+                    }
             idx = 0
             for where in (
                 "",
@@ -3240,9 +3323,16 @@ def _install_optimizer_accelerators(
                                 idx += 1
                                 continue
                             return orig_in_nulls(self)
-                        opt_sql = mod.optimizer.optimize(
-                            sql, schema=self.schema, dialect="duckdb"
-                        ).sql("duckdb")
+                        if opt_plan is not None:
+                            cur = _eval_opt_rule_query(opt_plan, idx, sql, "duckdb", in_nulls_kw, _exp)
+                            if cur is None:
+                                idx += 1
+                                continue
+                            opt_sql = cur.sql("duckdb")
+                        else:
+                            opt_sql = mod.optimizer.optimize(
+                                sql, schema=self.schema, dialect="duckdb"
+                            ).sql("duckdb")
                         if opt_sql != in_nulls_cache[idx]:
                             dfs = [
                                 self.conn.execute(
@@ -3934,6 +4024,118 @@ def _execute_tests_in_overlay(
                 cls.validate_all = _fast_parser_only_va
                 return (has_own_va, orig_va, has_own_vi, orig_vi, has_own_po, orig_po)
 
+            def _install_gen_only_validator_hooks(active_check=None):
+                global _VAL_ASTS
+                if _VAL_ASTS is None:
+                    _VAL_ASTS = pickle.loads(zlib.decompress(_VAL_CACHE["val_asts_z"]))
+                val_asts = _VAL_ASTS
+                from sqlglot import exp as _exp, parse_one as _sg_parse_one, tokens as _sg_tokens
+                from sqlglot.errors import ErrorLevel as _EL, UnsupportedError as _UE
+                _orig_tok_fn = _sg_tokens.Tokenizer.tokenize
+
+                def _fast_gen_only_vi(
+                    self,
+                    sql,
+                    write_sql=None,
+                    pretty=False,
+                    check_command_warning=False,
+                    identify=False,
+                    _orig=orig_vi,
+                    _va=val_asts,
+                    _otok=_orig_tok_fn,
+                ):
+                    if (
+                        _ASSERT_LOGS_DEPTH > 0
+                        or check_command_warning
+                        or _sg_tokens.Tokenizer.tokenize is not _otok
+                    ):
+                        return _orig(
+                            self,
+                            sql,
+                            write_sql=write_sql,
+                            pretty=pretty,
+                            check_command_warning=check_command_warning,
+                            identify=identify,
+                        )
+                    packed = _va.get((self.dialect or "", sql))
+                    if packed is None:
+                        return _orig(
+                            self,
+                            sql,
+                            write_sql=write_sql,
+                            pretty=pretty,
+                            check_command_warning=check_command_warning,
+                            identify=identify,
+                        )
+                    expr = _unpack_expr(packed, _exp)
+                    self.assertEqual(
+                        write_sql or sql,
+                        expr.sql(dialect=self.dialect, pretty=pretty, identify=identify),
+                    )
+                    return expr
+
+                def _fast_gen_only_va(
+                    self,
+                    sql,
+                    read=None,
+                    write=None,
+                    pretty=False,
+                    identify=False,
+                    _orig=orig_va,
+                    _va=val_asts,
+                    _acheck=active_check,
+                ):
+                    if _ASSERT_LOGS_DEPTH > 0:
+                        return _orig(
+                            self, sql, read=read, write=write, pretty=pretty, identify=identify
+                        )
+                    w_items = (
+                        {
+                            k: v
+                            for k, v in (write or {}).items()
+                            if not k or "," in k or _acheck(k)
+                        }
+                        if _acheck is not None
+                        else write
+                    )
+                    if not read and not w_items:
+                        return
+                    for read_dialect, read_sql in (read or {}).items():
+                        with self.subTest(f"{read_dialect} -> {sql}"):
+                            rp = _va.get((read_dialect or "", read_sql))
+                            r_expr = _unpack_expr(rp, _exp) if rp is not None else _sg_parse_one(read_sql, read_dialect)
+                            self.assertEqual(
+                                r_expr.sql(
+                                    self.dialect,
+                                    unsupported_level=_EL.IGNORE,
+                                    pretty=pretty,
+                                    identify=identify,
+                                ),
+                                sql,
+                            )
+                    if w_items:
+                        mp = _va.get((self.dialect or "", sql))
+                        expr = _unpack_expr(mp, _exp) if mp is not None else self.parse_one(sql)
+                        for write_dialect, write_sql in w_items.items():
+                            with self.subTest(f"{sql} -> {write_dialect}"):
+                                if write_sql is _UE:
+                                    with self.assertRaises(_UE):
+                                        expr.sql(write_dialect, unsupported_level=_EL.RAISE)
+                                else:
+                                    self.assertEqual(
+                                        expr.sql(
+                                            write_dialect,
+                                            unsupported_level=_EL.IGNORE,
+                                            pretty=pretty,
+                                            identify=identify,
+                                        ),
+                                        write_sql,
+                                    )
+
+                cls.validate_identity = _fast_gen_only_vi
+                cls.validate_all = _fast_gen_only_va
+                return (has_own_va, orig_va, has_own_vi, orig_vi, has_own_po, orig_po)
+
             if active_dialects:
                 from sqlglot.dialects.dialect import Dialect as _DCls
 
@@ -4020,35 +4222,53 @@ def _execute_tests_in_overlay(
 
                     cls.validate_all = _fast_parser_va
                 elif commit_mode == "gen_only":
-                    saved_validator_hooks = (has_own_va, orig_va, has_own_vi, orig_vi, has_own_po, orig_po)
-
-                    def _fast_active_gen_va(
-                        self,
-                        sql,
-                        read=None,
-                        write=None,
-                        pretty=False,
-                        identify=False,
-                        _orig=orig_va,
+                    if (
+                        "sqlglot/transforms.py" not in pfiles
+                        and _VAL_CACHE is not None
+                        and "val_asts_z" in _VAL_CACHE
+                        and not has_own_po
+                        and rel_file not in pfiles
                     ):
-                        if _ASSERT_LOGS_DEPTH > 0:
-                            return _orig(
-                                self, sql, read=read, write=write, pretty=pretty, identify=identify
-                            )
-                        w_sub = {
-                            k: v
-                            for k, v in (write or {}).items()
-                            if not k or "," in k or _is_active_d(k)
-                        }
-                        if not read and not w_sub:
-                            return
-                        return _orig(
-                            self, sql, read=read, write=w_sub, pretty=pretty, identify=identify
-                        )
+                        saved_validator_hooks = _install_gen_only_validator_hooks(_is_active_d)
+                    else:
+                        saved_validator_hooks = (has_own_va, orig_va, has_own_vi, orig_vi, has_own_po, orig_po)
 
-                    cls.validate_all = _fast_active_gen_va
+                        def _fast_active_gen_va(
+                            self,
+                            sql,
+                            read=None,
+                            write=None,
+                            pretty=False,
+                            identify=False,
+                            _orig=orig_va,
+                        ):
+                            if _ASSERT_LOGS_DEPTH > 0:
+                                return _orig(
+                                    self, sql, read=read, write=write, pretty=pretty, identify=identify
+                                )
+                            w_sub = {
+                                k: v
+                                for k, v in (write or {}).items()
+                                if not k or "," in k or _is_active_d(k)
+                            }
+                            if not read and not w_sub:
+                                return
+                            return _orig(
+                                self, sql, read=read, write=w_sub, pretty=pretty, identify=identify
+                            )
+
+                        cls.validate_all = _fast_active_gen_va
             elif commit_mode == "parser_only" and _VAL_CACHE is not None:
                 saved_validator_hooks = _install_parser_only_validator_hooks()
+            elif (
+                commit_mode == "gen_only"
+                and "sqlglot/transforms.py" not in pfiles
+                and _VAL_CACHE is not None
+                and "val_asts_z" in _VAL_CACHE
+                and not has_own_po
+                and rel_file not in pfiles
+            ):
+                saved_validator_hooks = _install_gen_only_validator_hooks()
             elif commit_mode == "opt_only" and _VAL_CACHE is not None and "val_opt_keys" in _VAL_CACHE:
                 val_opt_keys = _VAL_CACHE["val_opt_keys"]
                 saved_validator_hooks = (has_own_va, orig_va, has_own_vi, orig_vi, has_own_po, orig_po)
@@ -4560,9 +4780,10 @@ def _prewarm_libraries(
     need_val_cache: bool = False,
     need_tpcds_dumps: bool = True,
     need_in_nulls_dumps: bool = True,
+    need_val_asts: bool = False,
 ) -> None:
     """Pre-import third-party libraries & untouched sqlglot core modules once before os.fork()."""
-    global _TPC_CACHE, _VAL_CACHE, _TPCDS_ALL_OPT_DUMPS, _IN_NULLS_OPT_DUMPS, _TPCDS_RAW_DUMPS, _TPCDS_PLAN_EXPR_DUMPS
+    global _TPC_CACHE, _VAL_CACHE, _VAL_ASTS, _TPCDS_ALL_OPT_DUMPS, _IN_NULLS_OPT_DUMPS, _TPCDS_RAW_DUMPS, _TPCDS_PLAN_EXPR_DUMPS
     global _PRELOADED_SQLGLOT_FILES, _PRELOADED_SQLGLOT_MODS, _PRELOADED_MOD_FILE_REL, _PRELOADED_MOD_PKG_REL
     os.environ["OPENBLAS_NUM_THREADS"] = "1"
     os.environ["OMP_NUM_THREADS"] = "1"
@@ -4587,6 +4808,8 @@ def _prewarm_libraries(
             )
     if need_val_cache and _VAL_CACHE is None:
         _VAL_CACHE = _load_val_cache()
+    if need_val_asts and _VAL_CACHE is not None and _VAL_ASTS is None and "val_asts_z" in _VAL_CACHE:
+        _VAL_ASTS = pickle.loads(zlib.decompress(_VAL_CACHE["val_asts_z"]))
 
     mod_list = (
         (
@@ -4733,7 +4956,7 @@ def main() -> int:
         ad = set(req["active_dialects"]) if req.get("active_dialects") else None
         cm = req.get("commit_mode")
         _TPC_CACHE = _load_tpc_cache()
-        if cm == "parser_only" or (not ad and cm == "opt_only"):
+        if cm in ("parser_only", "gen_only") or (not ad and cm == "opt_only"):
             _VAL_CACHE = _load_val_cache()
         failed = _run_commit_tiers_in_process(
             Path(req["overlay"]),
@@ -4820,11 +5043,15 @@ def main() -> int:
         need_val_cache = False
         need_tpcds_dumps = False
         need_in_nulls_dumps = False
+        need_val_asts = False
         for cid, cands, pf in triaged:
             ad_list = _active_dialects_for(pf)
             cm = _classify_commit_mode(pf, base_repo)
             commit_meta[cid] = (ad_list, cm)
-            if cm == "parser_only" or (not ad_list and cm == "opt_only"):
+            if cm == "gen_only" and "sqlglot/transforms.py" not in pf:
+                need_val_cache = True
+                need_val_asts = True
+            elif cm == "parser_only" or (not ad_list and cm == "opt_only"):
                 need_val_cache = True
             for n in cands:
                 tinfo = selector.test_by_num[n]
@@ -4867,6 +5094,7 @@ def main() -> int:
                     need_val_cache=need_val_cache,
                     need_tpcds_dumps=need_tpcds_dumps,
                     need_in_nulls_dumps=need_in_nulls_dumps,
+                    need_val_asts=need_val_asts,
                 )
             for (cid, cands, patched_files), warm in ordered_tasks:
                 allow_heavy = (time.monotonic() - t_start) < wall_limit * 0.85
@@ -4897,6 +5125,7 @@ def main() -> int:
                 need_val_cache=need_val_cache,
                 need_tpcds_dumps=need_tpcds_dumps,
                 need_in_nulls_dumps=need_in_nulls_dumps,
+                need_val_asts=need_val_asts,
             )
             sel_io = selectors.DefaultSelector()
             worker_pids: list[int] = []
