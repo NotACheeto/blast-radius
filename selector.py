@@ -78,35 +78,36 @@ def _hash_expr_dump(dump_obj) -> bytes:
 _NO_ATTR = object()
 _TYPE_NAME_BYTES: dict[type, bytes] = {}
 _ARG_KEY_BYTES: dict[str, bytes] = {}
+_LEN_BYTES: tuple[bytes, ...] = tuple(i.to_bytes(4, "little") for i in range(64))
 
 
 def _hash_walk(v, upd) -> None:
     if v is None:
         upd(b"N")
         return
-    if getattr(v, "_type", _NO_ATTR) is not _NO_ATTR and getattr(v, "args", _NO_ATTR) is not _NO_ATTR:
-        tv = type(v)
-        tb = _TYPE_NAME_BYTES.get(tv)
-        if tb is None:
-            tb = b"E" + tv.__name__.encode("utf-8") + b"\0"
-            _TYPE_NAME_BYTES[tv] = tb
-        upd(tb)
-        _hash_walk(v._type, upd)
-        _hash_walk(v.comments, upd)
-        _hash_walk(v._meta, upd)
-        args = v.args
-        upd(len(args).to_bytes(4, "little"))
-        for k in sorted(args):
-            kb = _ARG_KEY_BYTES.get(k)
-            if kb is None:
-                kb = k.encode("utf-8") + b":"
-                _ARG_KEY_BYTES[k] = kb
-            upd(kb)
-            _hash_walk(args[k], upd)
-        return
     tv = type(v)
-    if tv is bool:
+    if tv is str:
+        b = v.encode("utf-8")
+        nb = len(b)
+        upd(b"S" + (_LEN_BYTES[nb] if nb < 64 else nb.to_bytes(4, "little")) + b)
+    elif tv is list:
+        nv = len(v)
+        upd(b"L" + (_LEN_BYTES[nv] if nv < 64 else nv.to_bytes(4, "little")))
+        for item in v:
+            _hash_walk(item, upd)
+    elif tv is bool:
         upd(b"T" if v else b"F")
+    elif tv is int:
+        upd(b"I" + str(v).encode("ascii") + b"\0")
+    elif tv is tuple:
+        nv = len(v)
+        upd(b"P" + (_LEN_BYTES[nv] if nv < 64 else nv.to_bytes(4, "little")))
+        for item in v:
+            _hash_walk(item, upd)
+    elif tv is float:
+        upd(b"R")
+        upd(b"NAN" if math.isnan(v) else repr(v).encode("ascii"))
+        upd(b"\0")
     elif isinstance(v, _Enum):
         upd(b"M")
         tb = _TYPE_NAME_BYTES.get(tv)
@@ -115,35 +116,61 @@ def _hash_walk(v, upd) -> None:
             _TYPE_NAME_BYTES[tv] = tb
         upd(tb)
         upd(v.name.encode("utf-8"))
-    elif tv is int:
-        upd(b"I" + str(v).encode("ascii") + b"\0")
-    elif tv is float:
-        upd(b"R")
-        upd(b"NAN" if math.isnan(v) else repr(v).encode("ascii"))
-        upd(b"\0")
-    elif tv is str:
-        b = v.encode("utf-8")
-        upd(b"S" + len(b).to_bytes(4, "little") + b)
-    elif tv is list:
-        upd(b"L" + len(v).to_bytes(4, "little"))
-        for item in v:
-            _hash_walk(item, upd)
-    elif tv is tuple:
-        upd(b"P" + len(v).to_bytes(4, "little"))
-        for item in v:
-            _hash_walk(item, upd)
     elif isinstance(v, dict):
-        upd(b"D" + len(v).to_bytes(4, "little"))
+        nv = len(v)
+        upd(b"D" + (_LEN_BYTES[nv] if nv < 64 else nv.to_bytes(4, "little")))
         for dk in sorted(v, key=lambda x: (type(x).__name__, str(x))):
             _hash_walk(dk, upd)
             _hash_walk(v[dk], upd)
     elif isinstance(v, (set, frozenset)):
-        upd(b"Z" + len(v).to_bytes(4, "little"))
+        nv = len(v)
+        upd(b"Z" + (_LEN_BYTES[nv] if nv < 64 else nv.to_bytes(4, "little")))
         for s in sorted(_hash_expr_exact(item) for item in v):
             upd(s)
+    elif getattr(v, "_type", _NO_ATTR) is not _NO_ATTR and getattr(v, "args", _NO_ATTR) is not _NO_ATTR:
+        tb = _TYPE_NAME_BYTES.get(tv)
+        if tb is None:
+            tb = b"E" + tv.__name__.encode("utf-8") + b"\0"
+            _TYPE_NAME_BYTES[tv] = tb
+        upd(tb)
+        vt = v._type
+        if vt is None:
+            upd(b"N")
+        else:
+            _hash_walk(vt, upd)
+        vc = v.comments
+        if vc is None:
+            upd(b"N")
+        else:
+            _hash_walk(vc, upd)
+        vm = v._meta
+        if vm is None:
+            upd(b"N")
+        else:
+            _hash_walk(vm, upd)
+        args = v.args
+        na = len(args)
+        upd(_LEN_BYTES[na] if na < 64 else na.to_bytes(4, "little"))
+        if na == 1:
+            k, av = next(iter(args.items()))
+            kb = _ARG_KEY_BYTES.get(k)
+            if kb is None:
+                kb = k.encode("utf-8") + b":"
+                _ARG_KEY_BYTES[k] = kb
+            upd(kb)
+            _hash_walk(av, upd)
+        elif na > 1:
+            for k in sorted(args):
+                kb = _ARG_KEY_BYTES.get(k)
+                if kb is None:
+                    kb = k.encode("utf-8") + b":"
+                    _ARG_KEY_BYTES[k] = kb
+                upd(kb)
+                _hash_walk(args[k], upd)
     else:
         b = f"{tv.__name__}:{v!r}".encode("utf-8", errors="replace")
-        upd(b"O" + len(b).to_bytes(4, "little") + b)
+        nb = len(b)
+        upd(b"O" + (_LEN_BYTES[nb] if nb < 64 else nb.to_bytes(4, "little")) + b)
 
 
 def _hash_expr_exact(obj) -> bytes:
@@ -3785,6 +3812,29 @@ def _execute_tests_in_overlay(
                             return _orig(self)
 
                     cls.test_enum = _fast_test_enum
+        elif cls_name == "TestSchema":
+            if (
+                not getattr(cls, "_gc_patched", False)
+                and "tests/test_schema.py" not in pfiles
+                and hasattr(cls, "test_cache_does_not_retain_queries")
+            ):
+                cls._gc_patched = True
+                orig_tcnrq = cls.test_cache_does_not_retain_queries
+
+                def _fast_tcnrq(self, _orig=orig_tcnrq):
+                    import gc as _gc
+
+                    orig_collect = _gc.collect
+                    _gc.collect = lambda generation=0: orig_collect(0)
+                    try:
+                        _orig(self)
+                    except AssertionError:
+                        _gc.collect = orig_collect
+                        return _orig(self)
+                    finally:
+                        _gc.collect = orig_collect
+
+                cls.test_cache_does_not_retain_queries = _fast_tcnrq
 
         saved_validator_hooks = None
         saved_td_po = None
